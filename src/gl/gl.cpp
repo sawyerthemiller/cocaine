@@ -59,6 +59,10 @@ inline u8* gp(GuestCall& c, u32 addr) {
 }
 
 inline u16 rd16(const u8* p) { return g_big ? (u16)(p[0] << 8 | p[1]) : (u16)(p[1] << 8 | p[0]); }
+inline void wr16(u8* p, u16 v) {
+  p[g_big ? 0 : 1] = (u8)(v >> 8);
+  p[g_big ? 1 : 0] = (u8)v;
+}
 inline u32 rd32(const u8* p) {
   return g_big ? (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3]
                : (u32)p[3] << 24 | (u32)p[2] << 16 | (u32)p[1] << 8 | p[0];
@@ -357,10 +361,7 @@ void present(GuestCall& c, Context* x) {
   if (dirty && whole) {
     u8* r = gp(c, whole);
     const s16 box[4] = {(s16)top, (s16)left, (s16)(top + x->height), (s16)(left + x->width)};
-    for (int k = 0; k < 4; k++) {
-      r[2 * k] = (u8)((u16)box[k] >> 8);
-      r[2 * k + 1] = (u8)box[k];
-    }
+    for (int k = 0; k < 4; k++) wr16(r + 2 * k, (u16)box[k]);
     c.call(dirty, {x->port, whole});
   }
   c.call(flush, {x->port, 0});
