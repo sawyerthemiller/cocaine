@@ -24,6 +24,7 @@
 #include <cerrno>
 #include <climits>
 
+#include "kernel/hooks.h"
 #include "kernel/process.h"
 
 namespace {
@@ -119,6 +120,7 @@ SysRet Process::sys_fork(Thread& t) {
       sole_thread_ = &t;
     }
     forget_pending_signals();  // they were the parent's
+    panel_fork_child();        // as was any wait for the file picker
     // Nor does a child get its parent's Mach ports, beyond the bootstrap
     // port: the host kernel gave this process a fresh, empty set. Its
     // semaphores and message queues are gone, and the C library, which knows

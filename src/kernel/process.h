@@ -104,6 +104,10 @@ struct Incoming {
   u32 audit[8] = {};      // ... and the longer form of that, with its pid
 };
 
+// A request to this Mac's file picker and its reply (viewer/picker.h).
+struct PickRequest;
+struct PickReply;
+
 // The guest display size, resolved at launch into COCAINE_DISPLAY from the
 // host's logical screen size; 1280 x 800 without a host screen (mach.cpp).
 void guest_display_size(u32& width, u32& height);
@@ -153,6 +157,14 @@ class Process {
   // changed to the viewer (mach.cpp). Nothing in other processes.
   void publish_display();
   void set_display_format(u32 width, u32 height, u32 stride, u32 bits);
+
+  // ---- panels.cpp: open and save panels, shown by this Mac's file picker ----
+  // Asks the picker's helper and waits for its reply on thread `t`. False if
+  // there is no answer to go by (said in the log); a cancel is true.
+  bool ask_file_picker(Thread& t, PickRequest& request, PickReply& reply);
+  // The host folder a panel should start in, for a folder the guest named;
+  // empty if there is no such folder.
+  std::string picker_start_folder(const std::string& guest_folder) const;
 
  private:
   // ---- process.cpp ----

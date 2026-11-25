@@ -42,6 +42,7 @@ add_executable(cocaine
   src/kernel/signals.cpp
   src/kernel/protect.cpp
   src/kernel/hooks.cpp
+  src/kernel/panels.cpp
   src/kernel/wallpaper.cpp
   src/gl/gl.cpp
   src/al/al.cpp

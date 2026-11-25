@@ -63,7 +63,9 @@ class GuestCall {
 };
 
 struct HookSpec {
-  const char* name;  // without the leading underscore
+  // A C function without the leading underscore, or an Objective-C method as
+  // written, "-[Class method:]" (the category, if given, is passed over).
+  const char* name;
   void (*fn)(GuestCall&);
   bool keep = false;  // keep the guest's own version callable (GuestCall::original)
 };
@@ -79,6 +81,10 @@ struct HookLibrary {
   const HookSpec* specs;
   size_t count;
   bool intel = false;  // also for Intel guests (the handlers mind the byte order)
+  // Set for a library whose stand-ins only work together: unless every one
+  // of `specs` is found, none is planted, and this is what the warning says
+  // happens instead.
+  const char* whole = nullptr;
 };
 
 // A native function the guest can call, made on the spot: its address in
@@ -92,3 +98,8 @@ const HookLibrary* al_hook_libraries(size_t& n);
 const HookLibrary* audio_hook_libraries(size_t& n);
 // src/kernel/hooks.cpp: the window server's screen updates
 const HookLibrary* display_hook_libraries(size_t& n);
+// src/kernel/panels.cpp: AppKit's open and save panels, shown by this Mac's file picker
+const HookLibrary* panel_hook_libraries(size_t& n);
+// The panels' lock, for Process::lock_for_fork, and what a forked child must forget.
+void panel_fork_lock(bool take);
+void panel_fork_child();

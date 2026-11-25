@@ -217,7 +217,9 @@ void Process::lock_for_fork(bool take) {
     x86_bus_lock(true);
     ppc_jit_fork_lock(true);
     x86_jit_fork_lock(true);
+    panel_fork_lock(true);
   } else {
+    panel_fork_lock(false);
     x86_jit_fork_lock(false);
     ppc_jit_fork_lock(false);
     x86_bus_lock(false);

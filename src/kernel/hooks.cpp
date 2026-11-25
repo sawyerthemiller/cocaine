@@ -7,6 +7,7 @@
 #include <sys/param.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -58,11 +59,30 @@ u32 hook_for(const std::string& name, void (*fn)(GuestCall&)) {
 u32 be32(const u8* p) { return (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3]; }
 u32 le32(const u8* p) { return (u32)p[3] << 24 | (u32)p[2] << 16 | (u32)p[1] << 8 | p[0]; }
 
+// An Objective-C method's symbol without its category:
+// "-[NSSavePanel(NSSavePanelLayout) _initContentView]" is
+// "-[NSSavePanel _initContentView]". Which category of a class holds a
+// method is the library's own business, and may differ between builds.
+std::string without_category(const std::string& name) {
+  const size_t open = name.find('('), space = name.find(' ');
+  if (open == std::string::npos || (space != std::string::npos && open > space)) return name;
+  const size_t close = name.find(')', open);
+  if (close == std::string::npos) return name;
+  return name.substr(0, open) + name.substr(close + 1);
+}
+
+bool is_method_name(const char* name) { return (name[0] == '-' || name[0] == '+') && name[1] == '['; }
+
 // The exported functions of the slice of `path` that starts at
 // `slice_offset`: names without the leading underscore, unslid addresses.
 // Also the __TEXT segment's address and file offset.
+//
+// Objective-C methods aren't exported: their symbols are local, named as
+// written ("-[Class method:]"). AppKit alone has 24,000, so only the ones in
+// `methods` are kept (named without the category), for the libraries whose
+// methods cocaine takes over.
 bool read_exports(const std::string& path, u64 slice_offset, bool big_endian, u32& text_vmaddr, u32& text_fileoff,
-                  std::vector<std::pair<std::string, u32>>& out) {
+                  std::vector<std::pair<std::string, u32>>& out, const std::unordered_set<std::string>& methods) {
   const int fd = open(path.c_str(), O_RDONLY);
   if (fd < 0) return false;
   auto read_at = [&](u64 at, u64 n, std::vector<u8>& buf) {
@@ -106,12 +126,20 @@ bool read_exports(const std::string& path, u64 slice_offset, bool big_endian, u3
       const u8* n = &syms[12 * k];
       const u32 strx = rd(n), value = rd(n + 8);
       const u8 type = n[4], sect = n[5];
-      // External (or private to the library's own files), defined in the
-      // first section (__text), not a debugging entry.
-      if (strx >= strs.size() || strs[strx] != '_') continue;
-      const std::string name((const char*)&strs[strx + 1], strnlen((const char*)&strs[strx + 1], strs.size() - strx - 1));
-      if ((type & 0xE0) || (type & 0x0E) != 0x0E || sect != 1 ||
-          (!(type & 0x11) && name != "VFBSelectMode")) continue;
+      // Defined in the first section (__text), not a debugging entry.
+      if (strx + 1 >= strs.size()) continue;
+      const bool method = is_method_name((const char*)&strs[strx]);
+      if (strs[strx] != '_' && !method) continue;
+      if ((type & 0xE0) || (type & 0x0E) != 0x0E || sect != 1) continue;
+      if (method && methods.empty()) continue;
+      const u32 from = method ? strx : strx + 1;
+      std::string name((const char*)&strs[from], strnlen((const char*)&strs[from], strs.size() - from));
+      if (method) {
+        name = without_category(name);
+        if (!methods.count(name)) continue;
+      } else if (!(type & 0x11) && name != "VFBSelectMode") {
+        continue;  // a function must be external, or private to the library's own files
+      }
       out.emplace_back(name, value);
     }
   }
@@ -230,6 +258,36 @@ bool ends_with(const std::string& s, const char* suffix) {
   return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
 }
 
+// Every list of libraries whose functions cocaine supplies.
+typedef const HookLibrary* (*HookList)(size_t&);
+constexpr HookList kHookLists[] = {gl_hook_libraries, al_hook_libraries, audio_hook_libraries,
+                                   display_hook_libraries, panel_hook_libraries};
+
+// The library at `path`, if it is one of those.
+const HookLibrary* hook_library_for(const std::string& path, bool powerpc) {
+  const HookLibrary* lib = nullptr;
+  for (HookList list : kHookLists) {
+    size_t nlibs = 0;
+    const HookLibrary* libs = list(nlibs);
+    for (size_t k = 0; k < nlibs; k++) {
+      if (!powerpc && !libs[k].intel) continue;
+      if (ends_with(path, libs[k].suffix)) lib = &libs[k];
+    }
+  }
+  return lib;
+}
+
+// The Objective-C methods cocaine takes over in the library at `path`.
+std::unordered_set<std::string> wanted_methods(const std::string& path, bool powerpc) {
+  std::unordered_set<std::string> out;
+  if (const HookLibrary* lib = hook_library_for(path, powerpc)) {
+    for (size_t k = 0; k < lib->count; k++) {
+      if (is_method_name(lib->specs[k].name)) out.insert(without_category(lib->specs[k].name));
+    }
+  }
+  return out;
+}
+
 }  // namespace
 
 // ---- arguments ----------------------------------------------------------------
@@ -340,27 +398,42 @@ void Process::note_code_mapping(u32 at, u32 len, int fd, u64 offset) {
   }
 
   // Is it one whose functions cocaine supplies?
-  const HookLibrary* lib = nullptr;
-  for (auto list : {gl_hook_libraries, al_hook_libraries, audio_hook_libraries, display_hook_libraries}) {
-    size_t nlibs = 0;
-    const HookLibrary* libs = list(nlibs);
-    for (size_t k = 0; k < nlibs; k++) {
-      if (!powerpc && !libs[k].intel) continue;
-      if (ends_with(img.path, libs[k].suffix)) lib = &libs[k];
-    }
-  }
+  const HookLibrary* lib = hook_library_for(img.path, powerpc);
 
   if (lib) {
     if (!read_image(img) || !img.usable) return;
     std::unordered_map<std::string, void (*)(GuestCall&)> mine;
     std::unordered_set<std::string> keep;
     for (size_t k = 0; k < lib->count; k++) {
-      mine[lib->specs[k].name] = lib->specs[k].fn;
-      if (lib->specs[k].keep) keep.insert(lib->specs[k].name);
+      const std::string name = without_category(lib->specs[k].name);
+      mine[name] = lib->specs[k].fn;
+      if (lib->specs[k].keep) keep.insert(name);
+    }
+    // A library taken over whole or not at all: its stand-ins only make
+    // sense together, so each must be there, once, inside this mapping.
+    bool plant = true;
+    if (lib->whole) {
+      std::unordered_map<std::string, int> found;
+      for (const auto& [name, addr] : img.exports) {
+        const u32 where = addr + img.slide;
+        if (mine.count(name) && where >= at && (u64)where + 8 <= (u64)at + len) found[name]++;
+      }
+      for (size_t k = 0; k < lib->count && plant; k++) {
+        const std::string name = without_category(lib->specs[k].name);
+        const int n = found.count(name) ? found[name] : 0;
+        if (n == 1) continue;
+        plant = false;
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) {
+          log_warn("this %s is not the one cocaine knows (%s is %s): %s", strrchr(lib->suffix, '/') + 1, name.c_str(),
+                   n ? "there more than once" : "missing", lib->whole);
+        }
+      }
     }
     const size_t pl = strlen(lib->prefix);
     u32 taken = 0;
     for (const auto& [name, addr] : img.exports) {
+      if (!plant) break;
       auto it = mine.find(name);
       if (it == mine.end() && (!pl || name.compare(0, pl, lib->prefix) != 0)) continue;
       const u32 where = addr + img.slide;
@@ -530,7 +603,9 @@ bool Process::read_image(MappedImage& img) {
   if (img.read) return img.usable;
   img.read = true;
   u32 text_vmaddr = 0, text_fileoff = 0;
-  if (!read_exports(img.path, img.slice_offset, arch_ == Arch::PPC, text_vmaddr, text_fileoff, img.exports))
+  const bool powerpc = arch_ == Arch::PPC;
+  if (!read_exports(img.path, img.slice_offset, powerpc, text_vmaddr, text_fileoff, img.exports,
+                    wanted_methods(img.path, powerpc)))
     return false;
   // Only the mapping of __TEXT says where the library went.
   img.usable = img.offset == img.slice_offset + text_fileoff;
