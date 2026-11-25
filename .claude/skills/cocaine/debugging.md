@@ -113,8 +113,8 @@ checks what the viewer holds back from the guest while a panel is up.
 
 The guest side of the panels is tested with real guests, on both CPUs (the
 Intel ones only with the keys, like Calculator), the stand-in answering
-every time. `tests/guest/panels.py` is one PyObjC program that runs some
-forty panels, rewriting the stand-in's answer file before each: fifty open
+every time. `tests/guest/panels.py` is one PyObjC program that runs 26
+panels, rewriting the stand-in's answer file before each: fifty open
 and fifty save panels made and let go with no window, every setting read
 back, each way of running a panel with a pick and a cancel, a folder,
 several files, types, a save with its extension added, a pick that takes

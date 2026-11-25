@@ -210,8 +210,8 @@ Moved from the README on 2026-11-18. What doesn't work yet, or works only partly
     guest with a SIGCHLD handler sees one signal more per panel. Leopard's
     Foundation waits for its children by number, so nothing on hand does.
   - The asking thread waits for the answer. Its own signal handlers run
-    after the panel answers, and a File menu opened by a key stays
-    highlighted while a modal panel is up.
+    after the panel answers, and the menu title a key shortcut lights up
+    (File, for Command-O) stays lit while a modal panel is up.
   - An app that puts the panel on the screen itself (`makeKeyAndOrderFront:`,
     its own modal session) gets an empty window.
   - Only AppKit 10.5.0's method names are proven. If another build lacks
