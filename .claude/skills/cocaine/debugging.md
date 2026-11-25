@@ -129,9 +129,10 @@ written to a refused place. TextEdit is run with a script: Open cancelled,
 the Apple menu opened (a panel once left the window server unable to open
 it), a file opened, a letter typed and saved over it, and Save As to
 another name, the test handing the stand-in each answer as the requests
-come in. A guest ended during a 60-second pick must take the helper with
-it within four seconds (`panel-wait.py`), and a Carbon `NavGetFile` from
-Python must come back cancelled (`nav.py`).
+come in. A guest that ends during a 60-second pick, by a thread of its own
+calling exit or ended from outside, must take the helper with it within
+seconds (`panel-wait.py`), and a Carbon `NavGetFile` from Python must come
+back cancelled (`nav.py`).
 
 The volume test always checks the guest root. To exercise a mounted disk
 image too, set `COCAINE_TEST_VOLUME` to its `/Volumes/...` mount point before

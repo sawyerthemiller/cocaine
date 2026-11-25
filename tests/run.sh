@@ -449,10 +449,22 @@ print(sum(a[(y * w + x) * 4:(y * w + x) * 4 + 4] != b[(y * w + x) * 4:(y * w + x
           fail=$((fail + 1))
         fi
 
-        # The guest is ended while the picker is up (as closing cocaine's
-        # window does): the picker's helper must go with it.
+        # The guest ends while the picker is up: the picker's helper must go
+        # with it. First by the guest's own doing, one thread calling exit
+        # while the main one waits in the panel; then ended from outside, as
+        # closing cocaine's window does.
         dir=$(cd "$(mktemp -d /tmp/cocaine-panel-test.XXXXXX)" && pwd -P)
         : > "$dir/in.txt"
+        began=$(date +%s)
+        COCAINE_PICK_OPEN="$dir/in.txt" COCAINE_PICK_DELAY=60 COCAINE_PICK_LOG="$dir/left" \
+          PYTHONDONTWRITEBYTECODE=1 "$cocaine" --arch "$arch" --sysroot "$root" \
+          "$root/usr/bin/python2.5" -c "$(cat "$here/guest/panel-wait.py")" exit > "$dir/exit.log" 2>&1 &
+        app=$!
+        wait $app
+        status=$?
+        left=no
+        [ $status -eq 7 ] && [ $(($(date +%s) - began)) -lt 20 ] && [ "$(grep -c '^request' "$dir/left" 2>/dev/null)" = 1 ] &&
+          [ -z "$(pgrep -f -- "--pick --session cocaine\.session\.$app\." 2>/dev/null)" ] && left=yes
         COCAINE_PICK_OPEN="$dir/in.txt" COCAINE_PICK_DELAY=60 COCAINE_PICK_LOG="$dir/requests" \
           PYTHONDONTWRITEBYTECODE=1 "$cocaine" --arch "$arch" --sysroot "$root" \
           "$root/usr/bin/python2.5" -c "$(cat "$here/guest/panel-wait.py")" > "$dir/app.log" 2>&1 &
@@ -479,13 +491,13 @@ print(sum(a[(y * w + x) * 4:(y * w + x) * 4 + 4] != b[(y * w + x) * 4:(y * w + x
           kill -9 $app $helper
           wait $app
         } 2>/dev/null
-        if [ $waiting = yes ] && [ $gone = yes ]; then
-          echo "ok    $arch ending a guest takes its file picker along"
+        if [ $left = yes ] && [ $waiting = yes ] && [ $gone = yes ]; then
+          echo "ok    $arch a guest that ends takes its file picker along"
           pass=$((pass + 1))
         else
-          echo "FAIL  $arch ending a guest during a pick (picker up: $waiting; both gone within 4 s: $gone)"
+          echo "FAIL  $arch a guest ending during a pick (its own exit: $left, status $status; ended from outside with the picker up: $waiting; both gone within 4 s: $gone)"
           drop_noise "$dir/app.log"
-          cat "$dir/app.log"
+          cat "$dir/exit.log" "$dir/app.log"
           fail=$((fail + 1))
         fi
         rm -rf "$dir"
