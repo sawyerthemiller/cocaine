@@ -41,7 +41,7 @@ feature or gap changes, update the README's short lists too.
 
 ```bash
 cmake -S . -B build -G Ninja && cmake --build build
-ctest --test-dir build --output-on-failure      # about 2 minutes; 121 guest checks
+ctest --test-dir build --output-on-failure      # about 4 minutes; 129 guest checks
 ```
 
 Filter the user's Mac tweak noise (`AppleSharpener`, `BlurTweak`) out of
@@ -50,7 +50,7 @@ interpreted; `t_x87`/`t_sse` compare against Rosetta, and if Rosetta's
 `oahd` hangs they get stuck: count stuck processes with
 `ps -ax -o stat,command | grep '\.host' | grep -c '^U'`. `tests/run.sh` sets
 `COCAINE_DISPLAY=1280x1024`. Look at `build/Testing/Temporary/LastTest.log`
-for the per-test lines (`121 passed, 0 failed`).
+for the per-test lines (`129 passed, 0 failed`).
 
 ## Running guests without looking at them
 
@@ -124,6 +124,11 @@ library's code is mapped. Handlers read arguments with `GuestCall`
 `native_function` makes a guest-callable function (used for Core Audio's
 worker thread). OpenGL/OpenAL (src/gl, src/al), Core Audio (src/audio) and
 the window server's `CGXUpdateDisplay` (screen publishing) work this way.
+A spec can also name an Objective-C method as written (`-[NSSavePanel
+filename]`, found by its local symbol, the category passed over), and a
+library with `whole` set is taken over only if every spec is found: AppKit's
+open and save panels (`src/kernel/panels.cpp`). In a handler, guest code
+that throws never comes back: hold nothing across a guest call.
 
 ## The menu bar logo (src/session/art.cpp)
 

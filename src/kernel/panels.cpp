@@ -475,20 +475,17 @@ void pick_now(GuestCall& c) {
 void begin(GuestCall& c, u32 self, u32 directory, u32 file, u32 types, u32 delegate, u32 selector, u32 context) {
   PickRequest request = request_for(c, self, directory, file, types);
   const u32 pick = sel(c, "_cocainePickNow:");
-  {
-    // Added to the class once; the runtime refuses a second time anyway.
-    static std::mutex once;
-    static bool added = false;
-    std::lock_guard<std::mutex> lk(once);
-    if (!added) {
-      const u32 imp = native_function(c.process, "-[NSSavePanel _cocainePickNow:]", pick_now);
-      const u32 types_at = c.scratch(8);
-      if (imp && types_at) {
-        memcpy(c.mem.host(types_at), "v@:@", 5);
-        c.call(fn(c, "class_addMethod"), {cls(c, "NSSavePanel"), pick, imp, types_at});
-        added = true;
-      }
-    }
+  // Added to the class once. No lock is held for it (a guest call): two
+  // threads here at the same moment both add, and the runtime refuses the
+  // second.
+  static std::atomic<bool> added{false};
+  if (!added) {
+    const u32 imp = native_function(c.process, "-[NSSavePanel _cocainePickNow:]", pick_now);
+    const u32 types_at = c.scratch(8);
+    if (!imp || !types_at || !pick) return;
+    memcpy(c.mem.host(types_at), "v@:@", 5);
+    c.call(fn(c, "class_addMethod"), {cls(c, "NSSavePanel"), pick, imp, types_at});
+    added = true;
   }
   {
     std::lock_guard<std::mutex> lk(g_mu);

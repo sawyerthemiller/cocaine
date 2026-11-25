@@ -23,6 +23,7 @@ environment variables, none of which change anything unless set:
 | `COCAINE_PICK_DELAY=seconds` | with `COCAINE_PICK_OPEN` or `COCAINE_PICK_SAVE`: wait that long before answering, as a person would (the helper still leaves at once if the guest goes away) |
 | `COCAINE_PICK_LOG=file` | append one line to `file` for each request the file picker's helper gets: `request`, then every field as `key=value` with tabs between (tabs, line ends and backslashes inside a value written as `\t`, `\n`, `\r`, `\\`). Counting the lines proves a script really reached a panel |
 | `COCAINE_PICK_REAL=1` | show the real panel even with `COCAINE_NO_VIEWER` or `COCAINE_SCRIPT` set. Without it such a run has nobody to answer a panel, so the helper answers cancel ("no viewer - file picker answered cancel") |
+| `COCAINE_GUEST_PANELS=1` | leave AppKit's open and save panels alone: nothing of `src/kernel/panels.cpp` is planted and a guest builds Leopard's own panel, which dies in Disk Arbitration. For working on the panels themselves |
 | `COCAINE_NOTE_MSG=number,first-last` | log every process that sends one of those Mach requests, and the answer it gets |
 | `COCAINE_CALLS=address,address` | log each call a PowerPC guest makes to one of those addresses, with its arguments |
 | `COCAINE_WATCH=address` | log each PowerPC store of a word to that address, and the code that made it |
@@ -110,6 +111,28 @@ would, with a socket pair as descriptor 3, and checks the replies to each
 within a second, and that an impossible answer is an error. The viewer test
 checks what the viewer holds back from the guest while a panel is up.
 
+The guest side of the panels is tested with real guests, on both CPUs (the
+Intel ones only with the keys, like Calculator), the stand-in answering
+every time. `tests/guest/panels.py` is one PyObjC program that runs some
+forty panels, rewriting the stand-in's answer file before each: fifty open
+and fifty save panels made and let go with no window, every setting read
+back, each way of running a panel with a pick and a cancel, a folder,
+several files, types, a save with its extension added, a pick that takes
+three seconds while a signal arrives, two threads asking at once, sheets
+and a modeless panel answered from the run loop, a sheet on a modal dialog
+that stops the modal session from its did-end method, and the paths a guest
+can't reach. After each panel it reads `COCAINE_PICK_LOG`: there must be one
+more request, saying what the panel was set to, so a panel that never
+reached the picker fails. `tests/run.sh` then checks from outside that the
+count matches, the saved file is where the stand-in said, and nothing was
+written to a refused place. TextEdit is run with a script: Open cancelled,
+the Apple menu opened (a panel once left the window server unable to open
+it), a file opened, a letter typed and saved over it, and Save As to
+another name, the test handing the stand-in each answer as the requests
+come in. A guest ended during a 60-second pick must take the helper with
+it within four seconds (`panel-wait.py`), and a Carbon `NavGetFile` from
+Python must come back cancelled (`nav.py`).
+
 The volume test always checks the guest root. To exercise a mounted disk
 image too, set `COCAINE_TEST_VOLUME` to its `/Volumes/...` mount point before
 running the suite. Optionally set `COCAINE_TEST_VOLUME_MARKER` to a file
@@ -132,8 +155,9 @@ src/cpu/x86/        32-bit Intel: the interpreter, x87 (with its 80-bit maths), 
 src/kernel/         the fake kernel: process loading, BSD system calls, sysctl,
                     Mach ports and messages, the comm page, path translation,
                     getattrlist, sockets, threads, processes, signals, IOKit
-                    and its input system, decrypting protected programs, and
-                    taking over guest library functions (hooks.cpp)
+                    and its input system, decrypting protected programs,
+                    taking over guest library functions (hooks.cpp), and
+                    AppKit's open and save panels (panels.cpp)
 src/session/        the session server, cocaine's stand-in for launchd
 src/viewer/         the window that shows the guest system's display, and the
                     helper that shows this Mac's file picker (picker.mm)

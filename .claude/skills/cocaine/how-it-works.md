@@ -253,6 +253,60 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   Losing the keyboard also tells the guest that no modifier key is held: a
   Command key still down when another program takes the keys is let go where
   the viewer can't see it.
+- **Open and save panels.** A guest's open or save panel is this Mac's file
+  picker. Leopard's own can't be built here: creating one loads its file
+  browser and sidebar, which start a thread that wants Disk Arbitration and
+  the Finder's services, and the program dies before the panel shows.
+  Getting it past that (the first try, 2026-11-20) left the program's window
+  server traffic in a state its other dialogs never recovered from. So the
+  panel is never built. When AppKit is mapped, cocaine takes over some of
+  NSSavePanel's methods (`src/kernel/panels.cpp`; NSOpenPanel only forwards
+  to them):
+  - Two steps of the init are skipped: `_initContentView` (the nibs and the
+    browser) and `_initPanelCommon` (the sidebar and the layout). The rest
+    of Apple's init runs, so the app holds a real NSSavePanel, with no
+    window behind it. That init sets every default through the public
+    setters, which is where cocaine's copy of the settings gets them.
+  - The settings that lived in the browser or the nib's controls are kept
+    by cocaine, by panel: multiple selection, files, folders, aliases,
+    packages, the starting folder, the prompt, the message, the name
+    field's label, the hidden extension and the accessory view (retained,
+    never shown). The rest (title, allowed and required types, delegate)
+    stay in the panel and are asked for when it runs.
+  - Every way of running a panel ends in three methods.
+    `runModalForDirectory:file:types:` asks the helper below and waits, on
+    the calling thread; the app's other threads carry on, so a pulsing
+    button keeps pulsing. The sheet and modeless ones must return before
+    they answer, so they have the main thread's run loop call a method
+    cocaine adds to the class, `-_cocainePickNow:`, in the default, modal
+    and tracking modes. It asks the helper, calls the app's did-end method
+    with the code and the context, and posts one application-defined event:
+    an app that stops its modal session from that method counts on an event
+    coming round for the session to notice.
+  - `filename`, `URL`, `directory` and the method behind `filenames` and
+    `URLs` answer from what the helper sent back.
+  - Carbon's Navigation Services is built on the same panels in Leopard.
+    Its six `_NSNavCreate...Dialog` functions in AppKit answer "cancelled"
+    (-128) for now.
+
+  Objective-C methods aren't exported, so the reader of a library's symbols
+  (`read_exports` in `hooks.cpp`) also takes local ones named like
+  `-[NSSavePanel filename]`: only those a library's list asks for (AppKit
+  has 24,000), and without the category, which another build may have moved
+  a method out of. AppKit is taken over whole or not at all: if one method
+  is missing or there twice, none is planted and a warning names it.
+  A handler runs as the guest's own thread, and the guest code it calls can
+  throw past it (Leopard's exceptions are longjmps), never to return: so no
+  lock is held across a guest call, and the app's did-end method is called
+  last, with the answer already stored. The wait for the helper is `poll`
+  in 100 ms slices: a signal for the guest interrupts it without reading as
+  an answer (its handler runs once the panel has answered), and the process
+  ending is noticed and takes the helper along. One request is out at a
+  time; a second thread's panel waits its turn. The helper is started with
+  `posix_spawn`, with descriptor 3, default signals and nothing else of the
+  guest's; the kernel lock is held from making the socket pair to closing
+  the helper's end, so a guest thread forking meanwhile can't carry a copy
+  off. `COCAINE_GUEST_PANELS=1` takes nothing over.
 - **The file picker's helper.** This Mac's open and save panels are shown
   for a guest by a process of their own, `cocaine --pick --session <name>`
   (`src/viewer/picker.mm`): this Mac's AppKit can't run inside a process

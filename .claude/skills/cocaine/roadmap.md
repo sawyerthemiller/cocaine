@@ -258,3 +258,15 @@ Moved from the README on 2026-11-18. Each step, what was done and what was learn
      `gui-v1.0` on GitHub (SKILL.md, "Cocaine.app").
    On hold, by the user's choice: the Dock and Finder (apps launching other
    apps through Launch Services) and VLC playing video.
+9. **Done for Cocoa apps.** Open and save panels, 2026-11-24. The first
+   try (2026-11-20) let Leopard's panel be built and put this Mac's picker
+   in front of it; the panel's browser crashed, and what was left of it
+   upset the window server. This time the panel is never built: its init
+   is left hollow, running it asks a helper process that shows this Mac's
+   picker, and the kernel learned the two calls a Save onto an existing
+   file needs (`access_extended`, and access control lists in
+   `setattrlist`). Learned on the way: Objective-C methods can be taken
+   over by their local symbols; a stand-in that waits must wait in slices,
+   or a signal reads as an answer; and a modal session stopped from a
+   timer doesn't notice until an event comes round. Carbon dialogs answer
+   "cancelled" for now (known-gaps.md).

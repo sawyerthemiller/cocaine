@@ -338,6 +338,175 @@ if [ -f "$root/usr/lib/dyld" ]; then
         echo "FAIL  $arch Calculator.app was not handed a typed key"
         fail=$((fail + 1))
       fi
+      if [ -f "$root/usr/bin/python2.5" ]; then
+        # Open and save panels. A guest's panel is a hollow one, and running
+        # it asks this Mac's file picker; here the picker's stand-in answers
+        # from a file the test rewrites before each panel, and notes every
+        # request it gets. A test passes only if the notes hold as many
+        # requests as panels were run: one that never reached the picker
+        # can't. Everything is kept in /tmp, which guest and host see alike.
+        panel_work=$(cd "$(mktemp -d /tmp/cocaine-panel-test.XXXXXX)" && pwd -P)
+        log="$work/panels-$arch.log"
+        actual=$(COCAINE_PICK_ANSWER="$panel_work/answer" COCAINE_PICK_LOG="$panel_work/requests" \
+          PYTHONDONTWRITEBYTECODE=1 "$cocaine" --arch "$arch" --sysroot "$root" \
+          "$root/usr/bin/python2.5" -c "$(cat "$here/guest/panels.py")" "$panel_work" "$root" "$HOME" 2>"$log")
+        status=$?
+        asked=$(grep -c '^request' "$panel_work/requests" 2>/dev/null)
+        # Also, from outside: the saved file is on this Mac where the picker
+        # said, the refused places were said to be out of reach, and nothing
+        # was written to them or to their twins in the system root.
+        stray=
+        for refused in "$HOME/Library/cocaine-panel-test-refused.txt" "$HOME/.cocaine-panel-test-refused" \
+          "$root$HOME/Library/cocaine-panel-test-refused.txt" "$root$HOME/.cocaine-panel-test-refused" \
+          "$root/Applications/cocaine-panel-test-refused.txt" /Applications/cocaine-panel-test-refused.txt; do
+          [ -e "$refused" ] && stray="$stray $refused"
+        done
+        if [ "$status" -eq 0 ] && [ "$actual" = "panels ok $asked" ] && [ "${asked:-0}" -ge 20 ] &&
+          [ "$(cat "$panel_work/saved by the guest.txt" 2>/dev/null)" = "written by the guest" ] &&
+          [ "$(grep -c "the file picker: this app can't reach that place" "$log")" -eq 4 ] && [ -z "$stray" ]; then
+          echo "ok    $arch open and save panels ($asked requests to the picker)"
+          pass=$((pass + 1))
+        else
+          echo "FAIL  $arch open and save panels: $actual (${asked:-no} requests to the picker${stray:+; written:$stray})"
+          drop_noise "$log"
+          cat "$log"
+          fail=$((fail + 1))
+        fi
+        rm -rf "$panel_work"
+
+        # A real application's panels, TextEdit's: Open is cancelled, and the
+        # Apple menu must still open afterwards (a panel once left the window
+        # server unable to track the mouse, which only a menu showed). Then a
+        # file is opened, a letter typed and saved over it, and Save As writes
+        # the same text under another name. A session whose daemons didn't
+        # start says nothing about panels, so that is tried once more.
+        textedit_panels() {
+          dir=$(cd "$(mktemp -d /tmp/cocaine-panel-test.XXXXXX)" && pwd -P)
+          printf 'cocaine picker test\n' > "$dir/in.txt"
+          : > "$dir/answer"
+          start=12
+          [ $arch = i386 ] && start=18
+          script="wait $start; key 31 111 100000; wait 3; shot $dir/before.raw; click 20 11; wait 2; shot $dir/menu.raw"
+          script="$script; key 53 27; wait 1.5; key 31 111 100000; wait 5; key 7 120; wait 1; key 1 115 100000"
+          script="$script; wait 3; key 1 83 120000; wait 5; shot $dir/end.raw"
+          COCAINE_PICK_ANSWER="$dir/answer" COCAINE_PICK_LOG="$dir/requests" COCAINE_SCRIPT="$script" \
+            "$cocaine" --arch $arch --sysroot "$root" "$root/Applications/TextEdit.app" > "$dir/app.log" 2>&1 &
+          app=$!
+          session_log="$(getconf DARWIN_USER_TEMP_DIR)cocaine-session-$app.log"
+          told=0
+          for tick in $(seq 1 $(((start + 50) * 4))); do
+            sleep 0.25
+            asked=$(grep -c '^request' "$dir/requests" 2>/dev/null)
+            if [ "${asked:-0}" -ne "$told" ]; then
+              # The next panel's answer: the file to open, then the name to save as.
+              [ "$asked" -eq 1 ] && printf '%s\n' "$dir/in.txt" > "$dir/answer"
+              [ "$asked" -eq 2 ] && printf '%s\n' "$dir/out.txt" > "$dir/answer"
+              told=$asked
+            fi
+            [ -s "$dir/end.raw" ] && break
+            kill -0 $app 2>/dev/null || break
+          done
+          alive=no
+          [ -s "$dir/end.raw" ] && kill -0 $app 2>/dev/null && alive=yes
+          kill $app 2>/dev/null
+          wait $app 2>/dev/null
+          menu=$(python3 -c 'import sys
+a, b = (open(p, "rb").read() for p in sys.argv[1:3])
+w = 1280
+print(sum(a[(y * w + x) * 4:(y * w + x) * 4 + 4] != b[(y * w + x) * 4:(y * w + x) * 4 + 4]
+          for y in range(340) for x in range(300)) if len(a) == len(b) == w * 1024 * 4 else -1)' \
+            "$dir/before.raw" "$dir/menu.raw" 2>/dev/null)
+          bad=$(cat "$dir/app.log" "$session_log" 2>/dev/null |
+            grep -a -c -e 'access lock failed' -e 'CGSAddTrackingRect' -e 'invalid context' -e 'unmapped')
+          result=1
+          if grep -a -q -e 'session was not ready in time' -e 'keeps failing' "$session_log" "$dir/app.log" 2>/dev/null; then
+            result=2
+            why="the session did not start"
+          elif [ "$alive" = yes ] && [ "$told" -eq 3 ] && [ "${menu:-0}" -gt 50000 ] && [ "$bad" -eq 0 ] &&
+            [ "$(cat "$dir/in.txt")" = "xcocaine picker test" ] && cmp -s "$dir/in.txt" "$dir/out.txt"; then
+            result=0
+          else
+            why="alive $alive, $told of 3 panels reached the picker, Apple menu $menu pixels, $bad error lines"
+            why="$why, opened file now '$(head -c 40 "$dir/in.txt")', saved copy '$(head -c 40 "$dir/out.txt" 2>/dev/null)'"
+            drop_noise "$dir/app.log"
+            tail -20 "$dir/app.log"
+          fi
+          rm -rf "$dir"
+          return $result
+        }
+        textedit_panels
+        result=$?
+        if [ $result -eq 2 ]; then
+          sleep 5
+          textedit_panels
+          result=$?
+        fi
+        if [ $result -eq 0 ]; then
+          echo "ok    $arch TextEdit.app opens, saves and saves as through the file picker"
+          pass=$((pass + 1))
+        else
+          echo "FAIL  $arch TextEdit.app and the file picker: $why"
+          fail=$((fail + 1))
+        fi
+
+        # The guest is ended while the picker is up (as closing cocaine's
+        # window does): the picker's helper must go with it.
+        dir=$(cd "$(mktemp -d /tmp/cocaine-panel-test.XXXXXX)" && pwd -P)
+        : > "$dir/in.txt"
+        COCAINE_PICK_OPEN="$dir/in.txt" COCAINE_PICK_DELAY=60 COCAINE_PICK_LOG="$dir/requests" \
+          PYTHONDONTWRITEBYTECODE=1 "$cocaine" --arch "$arch" --sysroot "$root" \
+          "$root/usr/bin/python2.5" -c "$(cat "$here/guest/panel-wait.py")" > "$dir/app.log" 2>&1 &
+        app=$!
+        helper=
+        for tick in $(seq 1 120); do
+          sleep 0.25
+          helper=$(pgrep -f -- "--pick --session cocaine\.session\.$app\." 2>/dev/null | head -1)
+          [ -n "$helper" ] && [ -s "$dir/requests" ] && break
+          kill -0 $app 2>/dev/null || break
+        done
+        waiting=no
+        [ -n "$helper" ] && [ "$(grep -c '^request' "$dir/requests" 2>/dev/null)" = 1 ] && kill -0 $app 2>/dev/null && waiting=yes
+        gone=no
+        {  # (the shell's own remark about the ended guest goes nowhere)
+          kill $app
+          for tick in $(seq 1 16); do
+            sleep 0.25
+            if ! kill -0 $app && ! kill -0 ${helper:-$app}; then
+              gone=yes
+              break
+            fi
+          done
+          kill -9 $app $helper
+          wait $app
+        } 2>/dev/null
+        if [ $waiting = yes ] && [ $gone = yes ]; then
+          echo "ok    $arch ending a guest takes its file picker along"
+          pass=$((pass + 1))
+        else
+          echo "FAIL  $arch ending a guest during a pick (picker up: $waiting; both gone within 4 s: $gone)"
+          drop_noise "$dir/app.log"
+          cat "$dir/app.log"
+          fail=$((fail + 1))
+        fi
+        rm -rf "$dir"
+
+        # A Carbon file dialog (Navigation Services, which Leopard builds on
+        # AppKit's panels) is answered "cancelled" without asking the picker.
+        dir=$(cd "$(mktemp -d /tmp/cocaine-panel-test.XXXXXX)" && pwd -P)
+        actual=$(COCAINE_PICK_LOG="$dir/requests" "$cocaine" --arch "$arch" --sysroot "$root" \
+          "$root/System/Library/Frameworks/Python.framework/Versions/2.5/Resources/Python.app/Contents/MacOS/Python" \
+          "$here/guest/nav.py" 2>"$dir/app.log")
+        if [ "$actual" = "Carbon file dialog cancelled" ] && [ ! -s "$dir/requests" ]; then
+          echo "ok    $arch Carbon file dialog answers cancelled"
+          pass=$((pass + 1))
+        else
+          echo "FAIL  $arch Carbon file dialog: $actual"
+          drop_noise "$dir/app.log"
+          cat "$dir/app.log"
+          fail=$((fail + 1))
+        fi
+        rm -rf "$dir"
+      fi
       if [ "$arch" = ppc ]; then
         if [ "$version" = 10.5.6 ] && [ -f "$root/usr/bin/python2.5" ]; then
           mode_work=$(mktemp -d /tmp/cocaine-mode-test.XXXXXX)

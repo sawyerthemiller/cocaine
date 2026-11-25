@@ -184,11 +184,40 @@ Moved from the README on 2026-11-18. What doesn't work yet, or works only partly
     `exchangedata` swaps the contents and leaves each name with its file ID,
     and which file a guest's FSRef names after a swap of names hasn't been
     checked.
-- Leopard's open and save panels don't work: the file browser stays
-  blank, and VLC's Browse button crashes in `DASessionScheduleWithRunLoop`
-  (no disk arbitration daemon). Tried on 2026-11-20 and rolled back: running
-  diskarbitrationd, and showing this Mac's picker in NSOpenPanel's place.
-  Opening Leopard's panel at all upsets the program's window server traffic
-  (oversized event messages, replies landing on the wrong call,
-  `CGSAddTrackingRect` errors), leaving its dialogs unresponsive; that is
-  the thing to fix first.
+- Open and save panels are this Mac's file picker (how-it-works.md, "Open
+  and save panels"); Leopard's own is never built. What that leaves out:
+  - Carbon file dialogs (Navigation Services) aren't shown. The program is
+    told the person cancelled, where it used to die. A stand-in needs the
+    reply record built (file references in an Apple event list) and the
+    program's event callback called.
+  - The panel's delegate isn't asked anything: `panel:shouldShowFilename:`,
+    `panel:isValidFilename:` and `panel:userEnteredFilename:confirmed:` are
+    never called, so an app that greys files out or checks names itself
+    doesn't get to.
+  - An accessory view (TextEdit's encoding menu, an export format's
+    options) is kept alive but never shown: its controls stay as the app
+    left them.
+  - iCloud Drive and `~/Library/CloudStorage` can't be picked. They are
+    inside the real Library, which guests don't see; the picker says the
+    app can't reach that place. Letting those two folders through is a
+    small change to `private_home_path` and bends the rule that guests
+    never touch the real Library.
+  - A disk the guest's volume list doesn't hold (one not under `/Volumes`)
+    is refused too, and so is one of this Mac's top-level folders picked as
+    a folder.
+  - The helper is a child of the guest's process. A guest that waits for
+    "any child" could collect it (cocaine then takes it as gone), and a
+    guest with a SIGCHLD handler sees one signal more per panel. Leopard's
+    Foundation waits for its children by number, so nothing on hand does.
+  - The asking thread waits for the answer. Its own signal handlers run
+    after the panel answers, and a File menu opened by a key stays
+    highlighted while a modal panel is up.
+  - Nothing tells cocaine when a panel is freed: its record, and the
+    strings and accessory view it retained, are let go when a new panel is
+    made at the same address.
+  - An app that puts the panel on the screen itself (`makeKeyAndOrderFront:`,
+    its own modal session) gets an empty window.
+  - Only AppKit 10.5.0's method names are proven. If another build lacks
+    one, nothing is taken over, a warning names it, and Leopard's own panel
+    is what the app gets: the file browser stays blank and the program dies
+    in `DASessionScheduleWithRunLoop` (no disk arbitration daemon).

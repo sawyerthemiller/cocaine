@@ -156,7 +156,7 @@ and apps are tested on both CPUs too.
 ## Not yet
 
 - QuickTime, and video in VLC.
-- Open and save panels - they come up blank, and VLC's Browse button crashes.
+- File dialogs in Carbon apps - they answer cancel. iCloud Drive can't be picked from.
 - The Dock and Finder - apps can't yet start other apps.
 - Copy and paste between apps.
 - The tools `ps` and `top`.
