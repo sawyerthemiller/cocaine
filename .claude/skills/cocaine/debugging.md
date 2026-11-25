@@ -18,6 +18,11 @@ environment variables, none of which change anything unless set:
 | `COCAINE_VIEWER_SNAPSHOT=file.png` | have the viewer save what its window shows, twelve seconds in |
 | `COCAINE_VIEWER_SCALE=actual` | viewer sizing: `actual` is one guest pixel per Mac logical point, `integer` uses the largest whole physical-pixel scale fitting the window, `fit` scales proportionally. Also in the View menu (Command-1/2/3). Takes precedence over `COCAINE_VIEWER_DOUBLE` |
 | `COCAINE_VIEWER_DOUBLE=0` | legacy override: one physical screen pixel per guest pixel, or two with `1`, fitting down if necessary. Only applies when explicitly set; game-specific defaults are retained. The View menu clears this override for that viewer |
+| `COCAINE_PICK_ANSWER=file` | answer the file picker's requests from `file` instead of showing this Mac's open or save panel. The file is read afresh for each request, so a test can rewrite it between panels: an optional first line `delay N` (seconds, may be a fraction), then one absolute host path a line; no paths means cancel, a missing file is an error. The answer goes through the same checks as a real pick (`src/viewer/picker.mm`): one the real panel could not give (a file where only folders are allowed, several where one is, a type the panel would grey out) or a place the guest can't reach is an error, which the guest sees as cancel |
+| `COCAINE_PICK_OPEN=path`, `COCAINE_PICK_SAVE=path` | the same for one kind of panel, without a file: paths separated by newlines, set but empty for cancel. `COCAINE_PICK_ANSWER` comes first if both are set. `tests/run.sh` sets both empty, so no test can put a real panel on the screen |
+| `COCAINE_PICK_DELAY=seconds` | with `COCAINE_PICK_OPEN` or `COCAINE_PICK_SAVE`: wait that long before answering, as a person would (the helper still leaves at once if the guest goes away) |
+| `COCAINE_PICK_LOG=file` | append one line to `file` for each request the file picker's helper gets: `request`, then every field as `key=value` with tabs between (tabs, line ends and backslashes inside a value written as `\t`, `\n`, `\r`, `\\`). Counting the lines proves a script really reached a panel |
+| `COCAINE_PICK_REAL=1` | show the real panel even with `COCAINE_NO_VIEWER` or `COCAINE_SCRIPT` set. Without it such a run has nobody to answer a panel, so the helper answers cancel ("no viewer - file picker answered cancel") |
 | `COCAINE_NOTE_MSG=number,first-last` | log every process that sends one of those Mach requests, and the answer it gets |
 | `COCAINE_CALLS=address,address` | log each call a PowerPC guest makes to one of those addresses, with its arguments |
 | `COCAINE_WATCH=address` | log each PowerPC store of a word to that address, and the code that made it |
@@ -92,6 +97,19 @@ keys for the Intel system programs aren't there, the Intel one must instead
 get as far as it can: through Launch Services to asking for the window
 server.
 
+Two host tests cover the file picker's helper without any guest or panel.
+`picker` (`tests/picker.mm`, which includes `src/viewer/picker.mm` the way
+`tests/viewer-resize.mm` includes the viewer) checks its plain functions: the
+messages, the open panel's type filter against the type lists VLC,
+Transmission and TextEdit really pass, how a saved name is finished, the
+stand-in answer file, the log line, and the path check, in a made-up system
+root and home folder under a temporary folder. `picker-process`
+(`tests/picker-process.cpp`) starts `cocaine --pick` as a guest's process
+would, with a socket pair as descriptor 3, and checks the replies to each
+`COCAINE_PICK_*` variable, that hanging up during a delay ends the helper
+within a second, and that an impossible answer is an error. The viewer test
+checks what the viewer holds back from the guest while a panel is up.
+
 The volume test always checks the guest root. To exercise a mounted disk
 image too, set `COCAINE_TEST_VOLUME` to its `/Volumes/...` mount point before
 running the suite. Optionally set `COCAINE_TEST_VOLUME_MARKER` to a file
@@ -117,7 +135,8 @@ src/kernel/         the fake kernel: process loading, BSD system calls, sysctl,
                     and its input system, decrypting protected programs, and
                     taking over guest library functions (hooks.cpp)
 src/session/        the session server, cocaine's stand-in for launchd
-src/viewer/         the window that shows the guest system's display
+src/viewer/         the window that shows the guest system's display, and the
+                    helper that shows this Mac's file picker (picker.mm)
 src/gl/, src/al/    OpenGL and OpenAL for guests, done by the Mac's own
 src/audio/          Core Audio's hardware layer and output units for guests, played
                     through the Mac's own output

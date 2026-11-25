@@ -21,7 +21,9 @@ struct DisplayFileHeader {
   // time since startup in milliseconds (CLOCK_UPTIME_RAW), 0 if never. While
   // that's recent the viewer hides the Mac's pointer and keeps it still.
   uint32_t pointer_held;
-  uint32_t reserved;
+  // The session's root process (0 if there is none), which the file picker's
+  // helper names its "panel is up" file after: see pick_flag_path.
+  uint32_t root;
 };
 
 // Shows the display in that file in a window, until the window is closed or

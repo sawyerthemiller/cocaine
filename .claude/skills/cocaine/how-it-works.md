@@ -250,6 +250,41 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   pointer and hold it still (`pointer_held` in the display file).
   Command-Option-M also toggles capture manually; the viewer tells the input
   system when capture changes, and releases it when the window loses focus.
+  Losing the keyboard also tells the guest that no modifier key is held: a
+  Command key still down when another program takes the keys is let go where
+  the viewer can't see it.
+- **The file picker's helper.** This Mac's open and save panels are shown
+  for a guest by a process of their own, `cocaine --pick --session <name>`
+  (`src/viewer/picker.mm`): this Mac's AppKit can't run inside a process
+  holding a guest, and the viewer belongs to the window server's process,
+  which the asking app has no line to. The guest's cocaine process starts
+  the helper with one end of a socket pair as descriptor 3, writes one
+  request (`key=value` fields ended by zero bytes, `picker.h`) and reads
+  one reply; the helper ends itself, panel and all, when that socket hangs
+  up or its parent goes. The panel is given no types: Leopard's lists mix
+  extensions, quoted HFS codes and type identifiers, and this Mac's type
+  table reads some extensions differently (jpg as jpeg), so the helper greys
+  files out itself and adds a saved name's required extension the way
+  Leopard's OK button did. Every pick is checked before the panel closes, so
+  the panel can say why and stay open: the guest is handed the path this
+  Mac's kernel gives back for the file (links followed, the stored spelling
+  of accents and case), with the system root's prefix taken off, and only if
+  that path read as a guest's path leads to the same file. That is the guest
+  side's own translation (`guest_to_host_path` and `host_to_guest_path` in
+  `src/kernel/paths.cpp`, which `Process::host_path` forwards to; the check
+  is `guest_path_for_pick`), so the real Library, home dot-files, links into
+  either, this Mac's system folders and new names in the system root's
+  `/Applications` are refused, as are disks the guest's volume list doesn't
+  hold and this Mac's top-level folders picked as folders. While the panel
+  is up the helper's process number sits in
+  `<DARWIN_USER_TEMP_DIR>cocaine-picker-<root pid>`; the viewer finds the
+  root in the display file's header, looks about eight times a second, and
+  while that process lives sends the guest no presses, movement or scrolling
+  (the asking app is waiting and would act on them all afterwards), only
+  keys and buttons let go. A click on the viewer then brings the panel to
+  the front, since the viewer's window can cover it. Runs with no viewer or
+  with a script never show a panel: the helper answers cancel, or what the
+  `COCAINE_PICK_*` variables say (debugging.md).
 - **Games: OpenGL and OpenAL.** Leopard's OpenGL drives graphics cards no
   Apple Silicon Mac has, and run as guest code it finds no renderer at all:
   every call quietly does nothing (Marble Blast crashed several calls

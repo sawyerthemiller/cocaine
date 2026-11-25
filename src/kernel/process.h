@@ -13,6 +13,7 @@
 #include "common.h"
 #include "cpu/ppc/ppc.h"
 #include "cpu/x86/x86.h"
+#include "kernel/paths.h"
 #include "macho/macho.h"
 #include "mem/guest_memory.h"
 
@@ -92,9 +93,6 @@ struct KPort {
   u32 item = 0;              // for an IOKit iterator: the kind of object still to hand out
   u32 initial_item = 0;      // the object to restore when an iterator is reset
 };
-
-// Browsable host volumes mounted under /Volumes, or an errno on failure.
-int mounted_volumes(std::vector<struct statfs>& volumes, int flags);
 
 // A message taken off a port and turned into what the guest will see, along
 // with what the kernel says about its sender.

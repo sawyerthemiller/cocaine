@@ -16,6 +16,7 @@
 #include "mem/guest_memory.h"
 #include "session/session.h"
 #include "session/ui_scale.h"
+#include "viewer/picker.h"
 #include "viewer/viewer.h"
 
 extern char** environ;
@@ -116,6 +117,7 @@ int main(int argc, char** argv) {
   std::optional<Arch> prefer;
   int session_root = 0;  // not zero: run as the session server for that process
   bool session_windows = false;
+  bool pick = false;  // run as the file picker's helper
   if (const char* root = getenv("COCAINE_SYSROOT")) opt.sysroot = root;
 
   int i = 1;
@@ -164,6 +166,10 @@ int main(int argc, char** argv) {
     } else if (a == "--view") {
       // Used by the process running the guest's window server: show its display.
       return run_viewer(value());
+    } else if (a == "--pick") {
+      // Used when a guest shows an open or save panel: answer its request
+      // (on descriptor 3) with this Mac's file picker. --session follows.
+      pick = true;
     } else if (a == "--session-server") {
       // Used by a session's first process to start the stand-in for launchd.
       session_root = atoi(value());
@@ -195,6 +201,7 @@ int main(int argc, char** argv) {
       return 125;
     }
   }
+  if (pick) return run_picker(opt.session);
   if (i >= argc && !session_root) {
     std::fputs(kUsage, stderr);
     return 125;

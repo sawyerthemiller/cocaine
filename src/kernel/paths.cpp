@@ -16,6 +16,7 @@
 #include <climits>
 #include <cstdlib>
 
+#include "kernel/paths.h"
 #include "kernel/process.h"
 #include "session/art.h"
 
@@ -98,9 +99,10 @@ std::string passwd_with_user(const std::string& original) {
   return copy;
 }
 
-// The home folder of the person running cocaine, as this Mac has it.
-const std::string& real_home() {
-  static const std::string home = [] {
+// The home folder of the person running cocaine, as this Mac has it (see
+// real_home). Looked up once; a test may put another folder in its place.
+std::string& home_slot() {
+  static std::string home = [] {
     const struct passwd* me = getpwuid(getuid());
     std::string dir = me && me->pw_dir ? me->pw_dir : "";
     while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
@@ -141,6 +143,11 @@ std::string mounted_volume(unsigned long long device) {
   return "";
 }
 
+}  // namespace
+
+const std::string& real_home() { return home_slot(); }
+void set_real_home_for_tests(const std::string& dir) { home_slot() = dir; }
+
 // The part of a home folder the guest system keeps to itself. A home folder
 // is this Mac's own, so that an old program can open the documents kept
 // there. But its Library is where programs keep their settings, caches and
@@ -168,8 +175,6 @@ std::string private_home_path(const std::string& root, const std::string& path) 
   return root + home + "/" + rest;
 }
 
-}  // namespace
-
 int mounted_volumes(std::vector<struct statfs>& volumes, int flags) {
   int count = getfsstat(nullptr, 0, flags);
   if (count < 0) return errno;
@@ -190,16 +195,16 @@ int mounted_volumes(std::vector<struct statfs>& volumes, int flags) {
   return 0;
 }
 
-std::string Process::bundled_wallpaper_path() const {
-  std::string dir = opt_.self_path;
+std::string bundled_wallpaper_path(const std::string& self_path) {
+  std::string dir = self_path;
   for (int up = 0; up < 2 && dir.rfind('/') != std::string::npos; up++) dir.erase(dir.rfind('/'));
   return dir + "/images/linen.jpeg";
 }
 
-std::string Process::host_path(const std::string& guest, bool follow_last) const {
-  const std::string& root = opt_.sysroot;
+std::string guest_to_host_path(const std::string& root, const std::string& guest, bool follow_last,
+                               const std::string& self_path) {
   if (root.empty() || guest.empty()) return guest;
-  if (guest == "/.cocaine/linen.jpeg") return bundled_wallpaper_path();
+  if (guest == "/.cocaine/linen.jpeg") return bundled_wallpaper_path(self_path);
   if (guest[0] != '/') {
     // A relative path is this Mac's business, except one that leads into
     // the private part of the home folder from the folder above it.
@@ -209,7 +214,7 @@ std::string Process::host_path(const std::string& guest, bool follow_last) const
     }
     char cwd[PATH_MAX];
     if (!getcwd(cwd, sizeof cwd)) return guest;
-    const std::string kept = private_home_path(root, tidy(guest_path(cwd) + "/" + guest));
+    const std::string kept = private_home_path(root, tidy(host_to_guest_path(root, cwd) + "/" + guest));
     return kept.empty() ? guest : kept;
   }
 
@@ -260,13 +265,13 @@ std::string Process::host_path(const std::string& guest, bool follow_last) const
         if (valid && stat(root.c_str(), &st) == 0 && device == (unsigned long long)st.st_dev) {
           std::string suffix;
           for (size_t i = 2; i < parts.size(); i++) suffix += "/" + parts[i];
-          return suffix.empty() ? root : host_path(suffix, follow_last);
+          return suffix.empty() ? root : guest_to_host_path(root, suffix, follow_last, self_path);
         }
         if (valid) {
           std::string volume = mounted_volume(device);
           if (!volume.empty()) {
             for (size_t i = 2; i < parts.size(); i++) volume += "/" + parts[i];
-            return host_path(tidy(volume), follow_last);
+            return guest_to_host_path(root, tidy(volume), follow_last, self_path);
           }
         }
         return path;
@@ -277,10 +282,10 @@ std::string Process::host_path(const std::string& guest, bool follow_last) const
       const bool found = fd >= 0 && fcntl(fd, F_GETPATH, real) == 0;
       if (fd >= 0) close(fd);
       if (!found) return path;
-      folder = guest_path(real);
+      folder = host_to_guest_path(root, real);
       if (folder == "/") folder = "";
       for (size_t i = 2; i < parts.size(); i++) folder += "/" + parts[i];
-      return host_path(folder.empty() ? "/" : folder, follow_last);
+      return guest_to_host_path(root, folder.empty() ? "/" : folder, follow_last, self_path);
     }
   }
   if (path == "/etc/passwd" || path == "/private/etc/passwd") {
@@ -341,11 +346,125 @@ std::string Process::host_path(const std::string& guest, bool follow_last) const
   return path;  // a symbolic link loop; let the host report it
 }
 
-std::string Process::guest_path(const std::string& host) const {
-  const std::string& root = opt_.sysroot;
+std::string host_to_guest_path(const std::string& root, const std::string& host) {
   if (!root.empty() && host.compare(0, root.size(), root) == 0 &&
       (host.size() == root.size() || host[root.size()] == '/')) {
     return host.size() == root.size() ? "/" : host.substr(root.size());
   }
   return host;
+}
+
+std::string Process::bundled_wallpaper_path() const { return ::bundled_wallpaper_path(opt_.self_path); }
+
+std::string Process::host_path(const std::string& guest, bool follow_last) const {
+  return guest_to_host_path(opt_.sysroot, guest, follow_last, opt_.self_path);
+}
+
+std::string Process::guest_path(const std::string& host) const {
+  return host_to_guest_path(opt_.sysroot, host);
+}
+
+// ---- Files picked on this Mac for a guest (the file picker's helper) ----
+
+namespace {
+
+bool same_file(const struct stat& a, const struct stat& b) {
+  return a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+}
+
+// Whether the guest's list of volumes (getfsstat: the system root's volume
+// and the browsable ones under /Volumes) holds the one with this number.
+// Carbon's file code can't name anything on a volume outside that list.
+bool guest_lists_device(const std::string& sysroot, dev_t device) {
+  struct stat st;
+  if (stat(sysroot.empty() ? "/" : sysroot.c_str(), &st) == 0 && st.st_dev == device) return true;
+  std::vector<struct statfs> mounts;
+  if (mounted_volumes(mounts, MNT_NOWAIT) != 0) return false;
+  for (const struct statfs& fs : mounts) {
+    if (stat(fs.f_mntonname, &st) == 0 && st.st_dev == device) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+PickedPath guest_path_for_pick(const std::string& sysroot, const std::string& picked, bool save,
+                               std::string& guest) {
+  std::string pick = picked;
+  while (pick.size() > 1 && pick.back() == '/') pick.pop_back();
+  if (pick.empty() || pick[0] != '/') return PickedPath::Missing;
+  char real[PATH_MAX];
+  struct stat picked_st, st;
+  const bool exists = stat(pick.c_str(), &picked_st) == 0;
+
+  if (!save) {
+    // An existing item. The guest is handed the one spelling this Mac's
+    // kernel gives back for it (links followed, the stored case and accents),
+    // which is also what Carbon's file code will later call it; and only if
+    // that path, read the way a guest's path is, leads to the same file. A
+    // file reached through a link into the real Library is not one: the
+    // guest's path for it lands on the system root's twin.
+    if (!exists || !realpath(pick.c_str(), real)) return PickedPath::Missing;
+    const std::string candidate = host_to_guest_path(sysroot, real);
+    const std::string back = guest_to_host_path(sysroot, candidate);
+    if (stat(back.c_str(), &st) != 0 || !same_file(st, picked_st)) return PickedPath::Unreachable;
+    if (!guest_lists_device(sysroot, picked_st.st_dev)) return PickedPath::HiddenDisk;
+    // Carbon gives "/" as the path of this Mac's top-level folders (/Users,
+    // /Volumes, /opt), so an app asked for one of those would open the root.
+    if (S_ISDIR(picked_st.st_mode) && candidate.size() > 1 && candidate.rfind('/') == 0 &&
+        back == candidate) {
+      return PickedPath::TopFolder;
+    }
+    guest = candidate;
+    return PickedPath::Ok;
+  }
+
+  // A name to save under: the folder must exist, the name need not.
+  const size_t slash = pick.rfind('/');
+  const std::string parent = slash == 0 ? "/" : pick.substr(0, slash);
+  std::string leaf = pick.substr(slash + 1);
+  struct stat parent_st;
+  if (leaf.empty() || stat(parent.c_str(), &parent_st) != 0 || !S_ISDIR(parent_st.st_mode) ||
+      !realpath(parent.c_str(), real)) {
+    return PickedPath::Missing;
+  }
+  const std::string folder = strcmp(real, "/") == 0 ? "" : real;
+  // A file already there keeps the spelling it is stored under, unless the
+  // name is a link: saving onto a link must not turn into saving onto what
+  // it points at.
+  struct stat link_st;
+  if (exists && lstat(pick.c_str(), &link_st) == 0 && !S_ISLNK(link_st.st_mode) &&
+      realpath(pick.c_str(), real)) {
+    const std::string stored = real;
+    const size_t at = stored.rfind('/');
+    if (stored.compare(0, at, folder) == 0 && at == folder.size()) leaf = stored.substr(at + 1);
+  }
+  const std::string candidate = host_to_guest_path(sysroot, folder + "/" + leaf);
+  // The whole name is translated, not only its folder: a dot-name in the home
+  // folder, or a new name in the system root's /Applications, sits in a
+  // folder the guest shares with this Mac and still lands somewhere else.
+  const std::string back = guest_to_host_path(sysroot, candidate);
+  const size_t back_slash = back.rfind('/');
+  if (back_slash == std::string::npos) return PickedPath::Unreachable;
+  const std::string back_parent = back_slash == 0 ? "/" : back.substr(0, back_slash);
+  if (stat(back_parent.c_str(), &st) != 0 || !same_file(st, parent_st)) return PickedPath::Unreachable;
+  const bool back_exists = stat(back.c_str(), &st) == 0;
+  if (back_exists != exists || (exists && !same_file(st, picked_st))) return PickedPath::Unreachable;
+  if (!guest_lists_device(sysroot, parent_st.st_dev)) return PickedPath::HiddenDisk;
+  guest = candidate;
+  return PickedPath::Ok;
+}
+
+const char* picked_path_refusal(PickedPath result) {
+  switch (result) {
+    case PickedPath::Ok: return "";
+    case PickedPath::Missing: return "that file or folder isn't there";
+    case PickedPath::Unreachable:
+      return "this app can't reach that place - it has its own Library and system folders. "
+             "pick something in your home folder or on another disk";
+    case PickedPath::HiddenDisk: return "this disk isn't visible to the app";
+    case PickedPath::TopFolder:
+      return "this app can't open that folder itself - pick a folder inside it";
+  }
+  return "";
 }

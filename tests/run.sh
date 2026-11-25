@@ -20,6 +20,11 @@ skip=0
 
 # No window of cocaine's own while testing: the guest's display isn't shown.
 export COCAINE_NO_VIEWER=1
+# And never this Mac's file picker: a guest's open or save panel is answered
+# "cancel" unless a test names an answer (COCAINE_PICK_ANSWER or these two).
+export COCAINE_PICK_OPEN=
+export COCAINE_PICK_SAVE=
+unset COCAINE_PICK_REAL
 # The clicks below are for the 1280 x 1024 desktop Leopard has on its own.
 export COCAINE_DISPLAY=1280x1024
 
