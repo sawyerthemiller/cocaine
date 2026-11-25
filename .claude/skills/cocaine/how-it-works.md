@@ -80,6 +80,13 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   root children use the guest volume root ID so Carbon can build paths.
   `setattrlist` translates 32-bit timestamps and byte order when Carbon sets
   folder dates and Finder metadata together.
+  A Cocoa Save onto an existing file ends in Carbon's `FSPathReplaceObject`,
+  which asks `access_extended` whether the old file may be written (several
+  questions in one call; each file's go to this Mac's own `accessx_np` with
+  the name translated) and then hands the new file the old one's dates,
+  permissions and access control list with `setattrlist`. The list travels
+  as a file security record, the same shape on both sides, with its numbers
+  turned round for PowerPC in both `getattrlist` and `setattrlist`.
   Volume enumeration uses the imported root's backing volume, including its
   actual read-only status, and adds browsable host mounts under `/Volumes`.
   Carbon's `/.vol/<device>/@` and root folder ID 2 resolve those mounts.

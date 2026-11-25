@@ -41,7 +41,7 @@ feature or gap changes, update the README's short lists too.
 
 ```bash
 cmake -S . -B build -G Ninja && cmake --build build
-ctest --test-dir build --output-on-failure      # about 2 minutes; 117 guest checks
+ctest --test-dir build --output-on-failure      # about 2 minutes; 121 guest checks
 ```
 
 Filter the user's Mac tweak noise (`AppleSharpener`, `BlurTweak`) out of
@@ -50,7 +50,7 @@ interpreted; `t_x87`/`t_sse` compare against Rosetta, and if Rosetta's
 `oahd` hangs they get stuck: count stuck processes with
 `ps -ax -o stat,command | grep '\.host' | grep -c '^U'`. `tests/run.sh` sets
 `COCAINE_DISPLAY=1280x1024`. Look at `build/Testing/Temporary/LastTest.log`
-for the per-test lines (`117 passed, 0 failed`).
+for the per-test lines (`121 passed, 0 failed`).
 
 ## Running guests without looking at them
 

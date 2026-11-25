@@ -189,6 +189,7 @@ class Process {
   SysRet sys_statfs(const struct statfs& fs, u32 buf, bool wide);
   SysRet sys_getattrlist(const std::string& path, u32 list, u32 buf, u32 size, u32 options);
   SysRet sys_setattrlist(const std::string& path, u32 list, u32 buf, u32 size, u32 options);
+  SysRet sys_access_extended(u32 entries, u32 size, u32 results);
   int open_appledouble_fork(const std::string& host, int flags);
   SysRet sys_socket_call(u32 num, SysArgs& a);
   void write_stat(u32 buf, const struct stat& st, bool wide);

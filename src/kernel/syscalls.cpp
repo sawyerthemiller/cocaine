@@ -87,11 +87,16 @@ const char* bsd_name(u32 n) {
     case 202: return "sysctl";
     case 220: return "getattrlist";
     case 221: return "setattrlist";
+    case 223: return "exchangedata";
     case 234: return "getxattr";
+    case 237: return "fsetxattr";
     case 240: return "listxattr";
     case 279: return "stat_extended";
     case 280: return "lstat_extended";
     case 281: return "fstat_extended";
+    case 282: return "chmod_extended";
+    case 283: return "fchmod_extended";
+    case 284: return "access_extended";
     case 341: return "stat64_extended";
     case 342: return "lstat64_extended";
     case 343: return "fstat64_extended";
@@ -786,6 +791,11 @@ SysRet Process::bsd_syscall(Thread& t, u32 num, SysArgs& a) {
       const std::string path = path_arg();
       const int mode = a.i();
       r = bad ? SysRet::err(EFAULT) : result(access(host_path(path).c_str(), mode));
+      break;
+    }
+    case 284: {  // access_extended; the last argument, a user to answer for, is ignored
+      const u32 entries = a.u(), size = a.u(), results = a.u();
+      r = sys_access_extended(entries, size, results);
       break;
     }
     case 58: {  // readlink

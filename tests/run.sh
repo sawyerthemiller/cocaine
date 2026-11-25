@@ -245,6 +245,35 @@ if [ -f "$root/usr/lib/dyld" ]; then
         cat "$log"
         fail=$((fail + 1))
       fi
+      # Several permission questions in one system call, as Carbon asks them.
+      log="$work/access-extended-$arch.log"
+      actual=$(PYTHONDONTWRITEBYTECODE=1 "$cocaine" --arch "$arch" --sysroot "$root" \
+        "$root/usr/bin/python2.5" -c "$(cat "$here/guest/access-extended.py")" 2>"$log")
+      status=$?
+      if [ "$status" -eq 0 ] && [ "$actual" = "access_extended ok" ]; then
+        echo "ok    $arch access_extended"
+        pass=$((pass + 1))
+      else
+        echo "FAIL  $arch access_extended: $actual"
+        drop_noise "$log"
+        cat "$log"
+        fail=$((fail + 1))
+      fi
+      # Cocoa documents saved onto files that are already there, which goes
+      # through Carbon's FSPathReplaceObject. No window is opened.
+      log="$work/save-$arch.log"
+      actual=$(PYTHONDONTWRITEBYTECODE=1 "$cocaine" --arch "$arch" --sysroot "$root" \
+        "$root/usr/bin/python2.5" -c "$(cat "$here/guest/save.py")" 2>"$log")
+      status=$?
+      if [ "$status" -eq 0 ] && [ "$actual" = "document save ok" ]; then
+        echo "ok    $arch document save onto an existing file"
+        pass=$((pass + 1))
+      else
+        echo "FAIL  $arch document save onto an existing file: $actual"
+        drop_noise "$log"
+        cat "$log"
+        fail=$((fail + 1))
+      fi
     fi
     # Processes: the shell forks, runs programs and scripts, pipes them
     # together and traps signals; arch starts programs for the other CPU.

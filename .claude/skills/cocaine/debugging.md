@@ -77,6 +77,11 @@ programs that use threads and fork from them, and `t_ipc`: two processes
 exchanging Mach messages with port rights and out-of-line memory in them.
 `task-for-pid.py` checks self and child task lookup, immediate post-fork
 lookup, exec, process exit, and rejection of processes outside the session.
+`access-extended.py` asks the kernel's several-questions-at-once permission
+call what Carbon asks, and `save.py` saves Cocoa documents (PyObjC, no
+window) onto files that already exist, with a backup, and over a file with
+an access control list. Both work in the guest system's own Library; give
+either a folder name as its argument to run it somewhere else.
 Three of Apple's daemons are tested through their clients: the guest system
 must know the person running the tests by name, and one program must hear a
 notification that another posts (`tests/guest/notify.sh`). And Calculator is

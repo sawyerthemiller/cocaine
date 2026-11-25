@@ -1,6 +1,8 @@
 // File-system calls that need more than a one-line translation.
 
+#include <sys/acl.h>
 #include <sys/attr.h>
+#include <sys/kauth.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
@@ -78,6 +80,30 @@ template <size_t N>
 bool known(u32 wanted, const AttrDef (&defs)[N]) {
   for (const AttrDef& d : defs) wanted &= ~d.bit;
   return wanted == 0;
+}
+
+// A file security record is how getattrlist and setattrlist carry an access
+// control list: a magic number, the owner's and group's identifiers, the
+// number of entries (-1 when there is no list at all), flags, and the
+// entries, each an identifier and two words. Host and guest lay it out the
+// same way; the numbers are in each side's byte order and the identifiers
+// are plain bytes. This turns the numbers of a record with `entries` entries
+// from one byte order into the other.
+void flip_filesec_numbers(u8* record, u32 entries) {
+  const auto flip = [&](size_t at) {
+    u32 value;
+    memcpy(&value, record + at, 4);
+    value = __builtin_bswap32(value);
+    memcpy(record + at, &value, 4);
+  };
+  flip(offsetof(struct kauth_filesec, fsec_magic));
+  flip(offsetof(struct kauth_filesec, fsec_acl.acl_entrycount));
+  flip(offsetof(struct kauth_filesec, fsec_acl.acl_flags));
+  for (u32 i = 0; i < entries; i++) {
+    const size_t entry = KAUTH_FILESEC_SIZE(i);
+    flip(entry + offsetof(struct kauth_ace, ace_flags));
+    flip(entry + offsetof(struct kauth_ace, ace_rights));
+  }
 }
 
 struct AppleDouble {
@@ -212,6 +238,68 @@ int Process::open_appledouble_fork(const std::string& host, int flags) {
   return reader;
 }
 
+// access_extended: several permission questions in one call, about one file
+// or more. Carbon asks this way before it replaces a file (FSReplaceObject,
+// behind every Cocoa Save onto an existing document: "may the original be
+// written?"). The request is an array of 16-byte entries (name offset, flags,
+// two unused words) followed by the names. An offset of zero means "the file
+// of the entry before", and the lowest name offset is where the array ends.
+// Every entry is answered with an error number of its own; the call itself
+// fails only for a malformed request or a name that can't be looked up at
+// all, and then writes no answers. The flags are access()'s three, or a set of
+// finer rights ("delete", say, which is up to the folder holding the file).
+// This Mac has the same call with the same flags, so each file's questions
+// go to its kernel, with the name translated; the checks on the request are
+// Leopard's own, since translating moves the names about.
+SysRet Process::sys_access_extended(u32 entries, u32 size, u32 results) {
+  const u32 kEntry = sizeof(struct accessx_descriptor);  // the same 16 bytes for the guest
+  if (size > ACCESSX_MAX_TABLESIZE) return SysRet::err(ENOMEM);
+  if (size < kEntry + 2) return SysRet::err(EINVAL);  // one entry and a one-letter name
+  if (!mem_.range_ok(entries, size)) return SysRet::err(EFAULT);
+  // The kernel ends the request with a zero byte of its own, so that a name
+  // can't run off the end.
+  std::string request((const char*)mem_.host(entries), size);
+  request[size - 1] = 0;
+  const auto offset = [&](u32 i) { return mem_.r32(entries + i * kEntry); };
+  const auto flags = [&](u32 i) { return mem_.r32(entries + i * kEntry + 4); };
+
+  const u32 most = (size - 2) / kEntry;
+  u32 count = most;
+  for (u32 i = 0; i < count; i++) {
+    // A name offset, counted in entries: the array can't reach past it.
+    const u32 end = offset(i) / kEntry;
+    if (end > most || offset(i) >= size || (end != 0 && end <= i)) return SysRet::err(EINVAL);
+    if (end == 0) {
+      if (i == 0) return SysRet::err(EINVAL);  // the first entry has no file before it
+      continue;
+    }
+    if (end < count) count = end;
+  }
+  if (count > ACCESSX_MAX_DESCRIPTORS) return SysRet::err(ENOMEM);
+
+  std::vector<u32> answers(count);
+  for (u32 first = 0, n; first < count; first += n) {
+    // One named entry and the entries after it that mean the same file.
+    for (n = 1; first + n < count && offset(first + n) == 0; n++) {}
+    const std::string host = host_path(request.c_str() + offset(first));
+    // (Two bytes past the name: the host wants room for a name of one letter
+    // even when this one is empty, which it answers as "no such file".)
+    std::vector<u8> ask(n * kEntry + host.size() + 2);
+    if (ask.size() > ACCESSX_MAX_TABLESIZE) return SysRet::err(ENAMETOOLONG);
+    auto* table = (struct accessx_descriptor*)ask.data();
+    for (u32 i = 0; i < n; i++) table[i].ad_flags = (int)flags(first + i);
+    table[0].ad_name_offset = n * kEntry;
+    memcpy(ask.data() + n * kEntry, host.c_str(), host.size());
+    // Leopard's kernel ignores the user argument and answers for the caller.
+    std::vector<int> errors(n);
+    if (accessx_np(table, ask.size(), errors.data(), getuid()) != 0) return SysRet::err(errno);
+    for (u32 i = 0; i < n; i++) answers[first + i] = (u32)errors[i];
+  }
+  if (!mem_.range_ok(results, count * 4)) return SysRet::err(EFAULT);
+  for (u32 i = 0; i < count; i++) mem_.w32(results + i * 4, answers[i]);
+  return SysRet::ok();
+}
+
 SysRet Process::sys_setattrlist(const std::string& path, u32 list, u32 buf, u32 size, u32 options) {
   if (!mem_.range_ok(list, 24) || !mem_.range_ok(buf, size)) return SysRet::err(EFAULT);
   struct attrlist al = {};
@@ -225,7 +313,8 @@ SysRet Process::sys_setattrlist(const std::string& path, u32 list, u32 buf, u32 
   const u32 supported = ATTR_CMN_SCRIPT | ATTR_CMN_CRTIME | ATTR_CMN_MODTIME |
                         ATTR_CMN_CHGTIME | ATTR_CMN_ACCTIME | ATTR_CMN_BKUPTIME |
                         ATTR_CMN_FNDRINFO | ATTR_CMN_OWNERID | ATTR_CMN_GRPID |
-                        ATTR_CMN_ACCESSMASK | ATTR_CMN_FLAGS | ATTR_CMN_UUID | ATTR_CMN_GRPUUID;
+                        ATTR_CMN_ACCESSMASK | ATTR_CMN_FLAGS | ATTR_CMN_EXTENDED_SECURITY |
+                        ATTR_CMN_UUID | ATTR_CMN_GRPUUID;
   if ((al.commonattr & ~supported) || al.volattr || al.dirattr || al.fileattr || al.forkattr) {
     log_warn("setattrlist asked for attributes that aren't translated yet "
              "(common %x volume %x dir %x file %x fork %x)",
@@ -233,6 +322,13 @@ SysRet Process::sys_setattrlist(const std::string& path, u32 list, u32 buf, u32 
     return SysRet::err(ENOTSUP);
   }
   std::vector<u8> data;
+  // An access control list isn't in the fixed part: a reference there says
+  // where its file security record is, counted from the reference, and how
+  // long. Carbon sends one whenever it replaces a file (every Cocoa Save
+  // onto an existing document), to give the new file the old one's list;
+  // for a file that had none, the record says "no list".
+  std::vector<u8> acl;
+  size_t acl_ref = 0;  // where the reference goes in `data`
   u32 at = 0;
   for (const AttrDef& d : kCommon) {
     if (!(al.commonattr & d.bit)) continue;
@@ -240,7 +336,27 @@ SysRet Process::sys_setattrlist(const std::string& path, u32 list, u32 buf, u32 
     if (guest_size > size - at) return SysRet::err(EINVAL);
     const size_t start = data.size();
     data.resize(start + host_size(d.type));
-    if (d.type == kTime) {
+    if (d.bit == ATTR_CMN_EXTENDED_SECURITY) {
+      const s32 offset = (s32)mem_.r32(buf + at);
+      const u32 length = mem_.r32(buf + at + 4);
+      const u32 room = size - at;  // from the reference to the end of the buffer
+      // The kernel's own checks: a whole record inside the buffer, the magic
+      // number, and a length that agrees with the number of entries.
+      if (offset < 0 || (u32)offset > room || room - (u32)offset < KAUTH_FILESEC_SIZE(0)) {
+        return SysRet::err(EINVAL);
+      }
+      const u32 record = buf + at + (u32)offset;
+      const u32 kCount = offsetof(struct kauth_filesec, fsec_acl.acl_entrycount);
+      const u32 listed = mem_.r32(record + kCount);
+      const u32 entries = listed == KAUTH_FILESEC_NOACL ? 0 : listed;
+      if (mem_.r32(record) != KAUTH_FILESEC_MAGIC || entries > KAUTH_ACL_MAX_ENTRIES ||
+          length != KAUTH_FILESEC_SIZE(entries) || length > room - (u32)offset) {
+        return SysRet::err(EINVAL);
+      }
+      acl.assign(mem_.host(record), mem_.host(record) + length);
+      if (mem_.big_endian()) flip_filesec_numbers(acl.data(), entries);
+      acl_ref = start;
+    } else if (d.type == kTime) {
       const s64 sec = (s32)mem_.r32(buf + at);
       const s64 nsec = (s32)mem_.r32(buf + at + 4);
       memcpy(data.data() + start, &sec, 8);
@@ -252,6 +368,11 @@ SysRet Process::sys_setattrlist(const std::string& path, u32 list, u32 buf, u32 
       memcpy(data.data() + start, mem_.host(buf + at), guest_size);
     }
     at += guest_size;
+  }
+  if (!acl.empty()) {
+    const attrreference_t ref = {(int32_t)(data.size() - acl_ref), (u_int32_t)acl.size()};
+    memcpy(data.data() + acl_ref, &ref, sizeof ref);
+    data.insert(data.end(), acl.begin(), acl.end());
   }
   const std::string host = host_path(path, !(options & 1));
   if (setattrlist(host.c_str(), &al, data.data(), data.size(), options) != 0) return SysRet::err(errno);
@@ -349,7 +470,12 @@ SysRet Process::sys_getattrlist(const std::string& path, u32 list, u32 buf, u32 
   // The attributes present, in the order both sides lay them out. Directory
   // attributes come back only for directories, file attributes only for files.
   std::vector<AttrType> fields;
-  for (const AttrDef& d : kCommon) if (al.commonattr & d.bit) fields.push_back(d.type);
+  size_t acl_field = SIZE_MAX;  // which of them is the access control list, if asked for
+  for (const AttrDef& d : kCommon) {
+    if (!(al.commonattr & d.bit)) continue;
+    if (d.bit == ATTR_CMN_EXTENDED_SECURITY) acl_field = fields.size();
+    fields.push_back(d.type);
+  }
   for (const AttrDef& d : kVolume) if (al.volattr & d.bit) fields.push_back(d.type);
   if (is_dir) {
     for (const AttrDef& d : kDir) if (al.dirattr & d.bit) fields.push_back(d.type);
@@ -376,9 +502,11 @@ SysRet Process::sys_getattrlist(const std::string& path, u32 list, u32 buf, u32 
     u32 length;
   };
   std::vector<Pending> pending;
-  size_t hp = 4;
+  size_t acl_ref = SIZE_MAX;  // the access control list's reference, in `out`
+  size_t hp = 4, field = 0;
   for (AttrType t : fields) {
     const size_t gp = out.size();
+    if (field++ == acl_field) acl_ref = gp;
     switch (t) {
       case kU32:
         put32(out, gp, get32(hp));
@@ -424,6 +552,12 @@ SysRet Process::sys_getattrlist(const std::string& path, u32 list, u32 buf, u32 
     const size_t at = out.size();
     if (p.host_data + p.length <= in.size()) {
       out.insert(out.end(), in.begin() + (long)p.host_data, in.begin() + (long)(p.host_data + p.length));
+      // A PowerPC guest reads the list's numbers the other way round.
+      if (be && p.guest_ref == acl_ref && p.length >= KAUTH_FILESEC_SIZE(0)) {
+        u32 entries = get32(p.host_data + offsetof(struct kauth_filesec, fsec_acl.acl_entrycount));
+        if (entries == KAUTH_FILESEC_NOACL) entries = 0;
+        if (p.length >= KAUTH_FILESEC_SIZE((u64)entries)) flip_filesec_numbers(out.data() + at, entries);
+      }
     }
     while (out.size() % 4) out.push_back(0);
     put32(out, p.guest_ref, (u32)(at - p.guest_ref));

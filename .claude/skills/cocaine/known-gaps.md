@@ -161,6 +161,29 @@ Moved from the README on 2026-11-18. What doesn't work yet, or works only partly
   CarbonCore, not yet understood), so it writes to an empty path plus `~`,
   which lands in the system root as `sysroots/10.5/~`. Harmless: the
   database is built again in memory on each run.
+- A few file system calls Leopard's libraries make while saving and copying
+  are not there yet. Each is logged once as "unimplemented system call" and
+  fails with "not supported".
+  - `fsetxattr` (237): `NSString writeToFile:atomically:encoding:error:` and
+    TextEdit store a text file's encoding as an extended attribute. The file
+    is written without it. Extended attributes are also listed as none and
+    read as absent.
+  - `chmod_extended` and `fchmod_extended` (282, 283): `copyItemAtPath:`
+    uses them to give the copy its source's permissions and access control
+    list in one go. The copy is made and has the permissions (checked);
+    whether a list on the source reaches it is not checked. The C library's
+    `acl_set_file` family is built on them too, so a guest can set a list
+    only through `setattrlist`, as Carbon does. The `stat_extended` family
+    still reports every file as having no list; `getattrlist` reports the
+    real one.
+  - `exchangedata` (223): only Carbon's `FSExchangeObjects` uses it, and it
+    fails. Cocoa's saves don't need it: they go through
+    `FSPathReplaceObject`, which renames. On an APFS disk Carbon answers -50
+    by itself without asking the kernel; on HFS+ it asks. Swapping the two
+    names (`renamex_np` with `RENAME_SWAP`) would not be the same thing:
+    `exchangedata` swaps the contents and leaves each name with its file ID,
+    and which file a guest's FSRef names after a swap of names hasn't been
+    checked.
 - Leopard's open and save panels don't work: the file browser stays
   blank, and VLC's Browse button crashes in `DASessionScheduleWithRunLoop`
   (no disk arbitration daemon). Tried on 2026-11-20 and rolled back: running
