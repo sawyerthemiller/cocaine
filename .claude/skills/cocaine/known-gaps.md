@@ -212,9 +212,6 @@ Moved from the README on 2026-11-18. What doesn't work yet, or works only partly
   - The asking thread waits for the answer. Its own signal handlers run
     after the panel answers, and a File menu opened by a key stays
     highlighted while a modal panel is up.
-  - Nothing tells cocaine when a panel is freed: its record, and the
-    strings and accessory view it retained, are let go when a new panel is
-    made at the same address.
   - An app that puts the panel on the screen itself (`makeKeyAndOrderFront:`,
     its own modal session) gets an empty window.
   - Only AppKit 10.5.0's method names are proven. If another build lacks

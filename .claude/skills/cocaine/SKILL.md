@@ -128,7 +128,9 @@ A spec can also name an Objective-C method as written (`-[NSSavePanel
 filename]`, found by its local symbol, the category passed over), and a
 library with `whole` set is taken over only if every spec is found: AppKit's
 open and save panels (`src/kernel/panels.cpp`). In a handler, guest code
-that throws never comes back: hold nothing across a guest call.
+that throws never comes back: hold nothing across a guest call. A guest
+function called through its address gets that address in r12 on PowerPC
+(`call_guest_args`), which an Objective-C method finds its data by.
 
 ## The menu bar logo (src/session/art.cpp)
 

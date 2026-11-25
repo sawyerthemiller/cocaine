@@ -272,7 +272,10 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
     packages, the starting folder, the prompt, the message, the name
     field's label, the hidden extension and the accessory view (retained,
     never shown). The rest (title, allowed and required types, delegate)
-    stay in the panel and are asked for when it runs.
+    stay in the panel and are asked for when it runs. The record goes when
+    the panel does: cocaine puts a method of its own in front of
+    NSSavePanel's `dealloc` (the runtime's `method_setImplementation`, which
+    hands back Apple's to call afterwards).
   - Every way of running a panel ends in three methods.
     `runModalForDirectory:file:types:` asks the helper below and waits, on
     the calling thread; the app's other threads carry on, so a pulsing

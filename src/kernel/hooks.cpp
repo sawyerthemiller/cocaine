@@ -693,6 +693,10 @@ u32 Process::call_guest_args(Thread& t, u32 fn, const std::vector<GuestArg>& arg
   }
   s.lr = kPPCGuestReturnAddr;
   s.pc = fn & ~3u;
+  // A call through a pointer arrives with the function's own address in
+  // r12, and code built to run at any address (an Objective-C method, called
+  // by objc_msgSend that way) finds its data from it.
+  s.gpr[12] = fn & ~3u;
   t.returned = false;
   run_ppc(t);
   const u32 result = s.gpr[3];

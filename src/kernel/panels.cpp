@@ -13,7 +13,8 @@
 //    NSSavePanel in every other way, with no window on the screen.
 //  - The settings that lived in the browser or the nib's controls (may it
 //    choose folders, the prompt, the folder to start in ...): kept here, by
-//    panel, and read back from here.
+//    panel, and read back from here. The record goes when the panel is
+//    freed, which a method put in front of its dealloc tells.
 //  - The three methods every way of running a panel ends in, and the three
 //    every way of reading its answer ends in. Running sends one request to
 //    the picker's helper (`cocaine --pick`, see viewer/picker.h) and waits
@@ -219,6 +220,53 @@ bool saves(GuestCall& c, u32 self) {
 
 // ---- the init -----------------------------------------------------------------
 
+// What a panel's record holds of the guest's, let go.
+void release_held(GuestCall& c, const Panel& p) {
+  for (u32 held : {p.directory, p.prompt, p.message, p.label, p.accessory}) msg(c, held, "release");
+}
+
+// -[NSSavePanel dealloc], which cocaine puts its own method in front of (the
+// runtime's method_setImplementation, so Apple's stays callable): the
+// panel's record goes, then Apple's dealloc runs.
+std::atomic<int> g_dealloc_state{0};  // 1 while being put in place, 2 once it is
+std::atomic<u32> g_dealloc_theirs{0};
+void panel_dealloc(GuestCall& c) {
+  const u32 self = c.i(), cmd = c.i();
+  Panel old;
+  bool had = false;
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto it = g_panels.find(self);
+    if (it != g_panels.end()) {
+      old = std::move(it->second);
+      g_panels.erase(it);
+      had = true;
+    }
+  }
+  if (had) {
+    log_debug("panel 0x%x: freed", self);
+    release_held(c, old);
+  }
+  if (const u32 theirs = g_dealloc_theirs) c.call(theirs, {self, cmd});
+  c.ret(0);
+}
+void watch_dealloc(GuestCall& c) {
+  int none = 0;
+  if (!g_dealloc_state.compare_exchange_strong(none, 1)) return;  // done, or another thread is at it
+  const u32 method = c.call(fn(c, "class_getInstanceMethod"), {cls(c, "NSSavePanel"), sel(c, "dealloc")});
+  const u32 theirs = method ? c.call(fn(c, "method_getImplementation"), {method}) : 0;
+  const u32 mine = theirs ? native_function(c.process, "-[NSSavePanel dealloc] (cocaine)", panel_dealloc) : 0;
+  if (!mine || !fn(c, "method_setImplementation")) {
+    // Records then stay until a new panel is made at the same address.
+    log_warn("can't tell when the guest frees an open or save panel; a little memory will go unused");
+    g_dealloc_state = 2;
+    return;
+  }
+  g_dealloc_theirs = theirs;
+  c.call(fn(c, "method_setImplementation"), {method, mine});
+  g_dealloc_state = 2;
+}
+
 // -_initContentView loads the browser's nibs; this is the step that starts
 // the thread that dies. In its place: a fresh record for this panel. The
 // init goes on to set every default through the setters below.
@@ -229,16 +277,16 @@ void init_content_view(GuestCall& c) {
     std::lock_guard<std::mutex> lk(g_mu);
     auto it = g_panels.find(self);
     if (it != g_panels.end()) {
-      // A panel that was here before, long gone: nothing says when a panel
-      // is freed, so what it held is let go now.
+      // A panel that was here before, whose end went unseen.
       old = std::move(it->second);
       g_panels.erase(it);
     }
     g_panels[self] = Panel();
   }
   log_debug("panel 0x%x: made hollow", self);
-  for (u32 held : {old.directory, old.prompt, old.message, old.label, old.accessory}) msg(c, held, "release");
   c.ret(0);
+  release_held(c, old);
+  watch_dealloc(c);
 }
 
 // -_initPanelCommon fills the sidebar and lays the window out.
