@@ -1,5 +1,7 @@
 #include "../src/viewer/viewer.mm"
 
+#include <sys/wait.h>
+
 #include <cstdio>
 #include <vector>
 
@@ -221,12 +223,96 @@ int main() {
     inputOK = inputOK && read(input[0], record, sizeof record) == sizeof record &&
               record[3] == 20 && record[4] == 10;
     view->holding = false;
+    // While the file picker's panel is up the guest is sent no presses,
+    // movement or scrolling, but still hears of keys and buttons let go.
+    auto nothing = [&] { return read(input[0], record, sizeof record) == -1 && errno == EAGAIN; };
+    auto key = [&](NSEventType type) {
+      return [NSEvent keyEventWithType:type location:NSZeroPoint modifierFlags:NSEventModifierFlagCommand
+                             timestamp:0 windowNumber:window.windowNumber context:nil characters:@"o"
+           charactersIgnoringModifiers:@"o" isARepeat:NO keyCode:31];
+    };
+    view->picker = getpid();
+    send(NSEventTypeLeftMouseDown, 1, NSMakePoint(500, 400));
+    send(NSEventTypeRightMouseDown, 3, NSMakePoint(500, 400));
+    for (uint32_t kind : {5u, 6u, 7u, 22u}) [view send:kind event:event];
+    [view send:10 event:key(NSEventTypeKeyDown)];
+    bool pickerOK = inputOK && nothing();
+    send(NSEventTypeLeftMouseUp, 2, NSMakePoint(250, 400));
+    pickerOK = pickerOK && read(input[0], record, sizeof record) == sizeof record &&
+               record[0] == 2 && record[1] == 160 && record[2] == 240;
+    send(NSEventTypeRightMouseUp, 4, NSMakePoint(250, 400));
+    pickerOK = pickerOK && read(input[0], record, sizeof record) == sizeof record && record[0] == 4;
+    [view send:11 event:key(NSEventTypeKeyUp)];
+    pickerOK = pickerOK && read(input[0], record, sizeof record) == sizeof record &&
+               record[0] == 11 && record[3] == 31;
+    [view send:12 event:key(NSEventTypeFlagsChanged)];
+    pickerOK = pickerOK && read(input[0], record, sizeof record) == sizeof record &&
+               record[0] == 12 && (uint32_t)record[4] == NSEventModifierFlagCommand;
+    view->picker = 0;
+    send(NSEventTypeLeftMouseDown, 1, NSMakePoint(250, 400));
+    pickerOK = pickerOK && read(input[0], record, sizeof record) == sizeof record && record[0] == 1;
+    // Losing the keyboard tells the guest no modifier key is held, where the
+    // pointer last was; a viewer that never sent anything says nothing.
+    [view resignedKey];
+    pickerOK = pickerOK && read(input[0], record, sizeof record) == sizeof record &&
+               record[0] == 12 && record[1] == 160 && record[2] == 240 &&
+               record[3] == 0 && record[4] == 0 && record[5] == 0 && nothing();
+    view->sentPoint = false;
+    [view resignedKey];
+    pickerOK = pickerOK && nothing();
+    // The panel is up while the helper's flag file names a living process.
+    // A stand-in process here: not this one, which the viewer would then try
+    // to hand the screen to.
+    const uint32_t session = (uint32_t)getpid();
+    const std::string flag = pick_flag_path((int)session);
+    auto setFlag = [&](const std::string& text) {
+      FILE* f = fopen(flag.c_str(), "w");
+      if (f) {
+        fputs(text.c_str(), f);
+        fclose(f);
+      }
+    };
+    unlink(flag.c_str());
+    const pid_t helper = fork();
+    if (helper == 0) {
+      pause();
+      _exit(0);
+    }
+    pickerOK = pickerOK && helper > 0 && viewer_picker_up(0) == 0 && viewer_picker_up(session) == 0;
+    setFlag("not a number\n");
+    pickerOK = pickerOK && viewer_picker_up(session) == 0;
+    setFlag(std::to_string(helper) + "\n");
+    pickerOK = pickerOK && viewer_picker_up(session) == helper;
+    view->root = session;
+    view->manualCapture = true;
+    [view checkPicker];
+    pickerOK = pickerOK && view->picker == helper && !view->manualCapture;
+    send(NSEventTypeLeftMouseDown, 1, NSMakePoint(500, 400));
+    pickerOK = pickerOK && nothing();
+    if (helper > 0) {
+      kill(helper, SIGKILL);
+      waitpid(helper, nullptr, 0);
+    }
+    pickerOK = pickerOK && viewer_picker_up(session) == 0;  // the file is still there; its process is not
+    [view checkPicker];
+    pickerOK = pickerOK && view->picker == 0;
+    send(NSEventTypeLeftMouseDown, 1, NSMakePoint(500, 400));
+    pickerOK = pickerOK && read(input[0], record, sizeof record) == sizeof record && record[0] == 1;
+    unlink(flag.c_str());
+    view->root = 0;
+    for (uint32_t kind : {1u, 3u, 5u, 6u, 7u, 10u, 22u}) pickerOK = pickerOK && viewer_kept_from_guest(kind);
+    for (uint32_t kind : {0u, 2u, 4u, 11u, 12u, (uint32_t)kViewerCaptureChanged})
+      pickerOK = pickerOK && !viewer_kept_from_guest(kind);
     CFRelease(movement);
     const bool restored = dup2(output, STDOUT_FILENO) >= 0;
     close(output);
     close(input[0]);
     if (!inputOK || !restored) {
       fprintf(stderr, "letterboxed viewer forwarded incorrect mouse input\n");
+      return 1;
+    }
+    if (!pickerOK) {
+      fprintf(stderr, "viewer mishandled input, or the helper's flag, while the file picker was up\n");
       return 1;
     }
   }

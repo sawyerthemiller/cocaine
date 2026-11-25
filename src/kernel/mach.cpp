@@ -563,8 +563,11 @@ void Process::share_display(u32 addr, u64 shared_bytes) {
   u8* map = (u8*)mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   close(fd);
   if (map == MAP_FAILED) return;
+  // The session's root, for the viewer to find the file picker's flag by.
+  int session_root = 0;
+  if (sscanf(opt_.session.c_str(), "cocaine.session.%d.", &session_root) != 1 || session_root < 0) session_root = 0;
   const DisplayFileHeader head = {kDisplayFileMagic, width, height, mem_.big_endian() ? 1u : 0u,
-                                  (u32)getpid(), 0, 0, 0};
+                                  (u32)getpid(), 0, 0, (u32)session_root};
   memcpy(map, &head, sizeof head);
   display_w_ = width;
   display_h_ = height;

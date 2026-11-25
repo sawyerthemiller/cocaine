@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "viewer/picker.h"
 #include "viewer/viewer.h"
 
 enum class ViewerScale { Actual, Integer, Fit };
@@ -109,6 +110,28 @@ static NSSize viewer_content_size(uint32_t width, uint32_t height, ViewerScale m
                      std::max(1.0, std::ceil(image.size.height)));
 }
 
+// The file picker's helper while it has a panel on the screen for this
+// session, else 0: the helper leaves its process number in a file named
+// after the session's root, and the panel is up for as long as that process
+// lives (a helper that was killed leaves the file behind).
+static pid_t viewer_picker_up(uint32_t root) {
+  if (!root) return 0;
+  FILE* f = fopen(pick_flag_path((int)root).c_str(), "r");
+  if (!f) return 0;
+  int pid = 0;
+  if (fscanf(f, "%d", &pid) != 1) pid = 0;
+  fclose(f);
+  return pid > 0 && kill(pid, 0) == 0 ? (pid_t)pid : 0;
+}
+
+// What the guest isn't sent while the picker is up: the app that asked for
+// it is waiting and would only save these up and act on them all afterwards.
+// Presses, movement and the wheel are kept back; a key or a button let go
+// still goes through, so nothing is left held down in the guest.
+static bool viewer_kept_from_guest(uint32_t kind) {
+  return kind == 1 || kind == 3 || (kind >= 5 && kind <= 7) || kind == 10 || kind == 22;
+}
+
 @interface CocaineDisplayView : NSView {
  @public
   const uint8_t* pixels;
@@ -128,6 +151,11 @@ static NSSize viewer_content_size(uint32_t width, uint32_t height, ViewerScale m
   bool manualCapture, suppressAutoHold, swallowCaptureKeyUp;
   bool skipMove;                   // the next movement includes putting the pointer back
   double moveX, moveY;             // movement not yet amounting to a whole point
+  uint32_t root;                   // the session's root process (DisplayFileHeader)
+  pid_t picker;                    // the file picker's helper while its panel is up, else 0
+  bool pickerYielded;              // ... and it has been told it may come to the front
+  bool sentPoint;                  // lastX and lastY are where the guest was last told the pointer is
+  int32_t lastX, lastY;
 }
 - (void)show;
 - (void)hold:(bool)hold;
@@ -135,6 +163,8 @@ static NSSize viewer_content_size(uint32_t width, uint32_t height, ViewerScale m
 - (void)layoutPicture;
 - (void)sizeToDisplay;
 - (void)chooseScale:(NSMenuItem*)item;
+- (void)checkPicker;
+- (void)resignedKey;
 @end
 
 @implementation CocaineDisplayView
@@ -239,6 +269,7 @@ static NSSize viewer_content_size(uint32_t width, uint32_t height, ViewerScale m
 - (BOOL)acceptsFirstResponder { return YES; }
 - (BOOL)acceptsFirstMouse:(NSEvent*)event { return YES; }
 - (void)send:(uint32_t)kind event:(NSEvent*)event {
+  if (picker && viewer_kept_from_guest(kind)) return;
   const NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
   const NSRect image = [self imageRect];
   if (NSIsEmptyRect(image)) return;
@@ -285,9 +316,13 @@ static NSSize viewer_content_size(uint32_t width, uint32_t height, ViewerScale m
     scrollX -= more;
   }
   const int32_t record[6] = {(int32_t)kind, (int32_t)guest.x, (int32_t)guest.y, key, extra, more};
+  sentPoint = true;
+  lastX = record[1];
+  lastY = record[2];
   (void)write(STDOUT_FILENO, record, sizeof record);
 }
 - (void)keyDown:(NSEvent*)event {
+  if (picker) return;
   const NSEventModifierFlags modifiers = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
   if (event.keyCode == 46 && modifiers == (NSEventModifierFlagCommand | NSEventModifierFlagOption)) {
     if (!event.isARepeat) {
@@ -308,9 +343,25 @@ static NSSize viewer_content_size(uint32_t width, uint32_t height, ViewerScale m
   [self send:11 event:event];
 }
 - (void)flagsChanged:(NSEvent*)event { [self send:12 event:event]; }
-- (void)mouseDown:(NSEvent*)event { [self send:1 event:event]; }
+// A click on the guest's picture while the picker is up is a person looking
+// for the panel: this window is nearly the screen's size and may have
+// covered it. The panel's program is brought to the front instead.
+- (bool)raisePicker {
+  if (!picker) return false;
+  NSRunningApplication* helper = [NSRunningApplication runningApplicationWithProcessIdentifier:picker];
+  if (helper) {
+    if (@available(macOS 14.0, *)) [NSApp yieldActivationToApplication:helper];
+    [helper activateWithOptions:0];
+  }
+  return true;
+}
+- (void)mouseDown:(NSEvent*)event {
+  if (![self raisePicker]) [self send:1 event:event];
+}
 - (void)mouseUp:(NSEvent*)event { [self send:2 event:event]; }
-- (void)rightMouseDown:(NSEvent*)event { [self send:3 event:event]; }
+- (void)rightMouseDown:(NSEvent*)event {
+  if (![self raisePicker]) [self send:3 event:event];
+}
 - (void)rightMouseUp:(NSEvent*)event { [self send:4 event:event]; }
 - (void)mouseMoved:(NSEvent*)event { [self send:5 event:event]; }
 - (void)mouseDragged:(NSEvent*)event { [self send:6 event:event]; }
@@ -342,6 +393,41 @@ static NSSize viewer_content_size(uint32_t width, uint32_t height, ViewerScale m
     [NSCursor unhide];
   }
 }
+// Looked at about eight times a second.
+- (void)checkPicker {
+  const pid_t now = viewer_picker_up(root);
+  if (now != picker) {
+    picker = now;
+    pickerYielded = false;
+    if (now) {
+      manualCapture = false;
+      [self hold:false];
+    }
+  }
+  if (picker && !pickerYielded) {
+    // The helper asks to come to the front as it starts, which this Mac may
+    // refuse while this program is the one in front, unless this program
+    // says it may. The helper may not be known to the system just yet.
+    NSRunningApplication* helper = [NSRunningApplication runningApplicationWithProcessIdentifier:picker];
+    if (helper) {
+      if (@available(macOS 14.0, *)) [NSApp yieldActivationToApplication:helper];
+      pickerYielded = true;
+    }
+  }
+}
+// The window is no longer the one keys go to. A modifier key held at that
+// moment (the Command of the Command-O that brought the picker up, say) is
+// let go where this window can't see it, and the guest would go on thinking
+// it held: so the guest is told that none is.
+- (void)resignedKey {
+  if (sentPoint) {
+    const int32_t record[6] = {12, lastX, lastY, 0, 0, 0};
+    (void)write(STDOUT_FILENO, record, sizeof record);
+  }
+  manualCapture = false;
+  suppressAutoHold = false;
+  [self hold:false];
+}
 - (void)tick:(NSTimer*)timer {
   if (__atomic_load_n(frame, __ATOMIC_ACQUIRE) != shown) [self show];
   const uint32_t at = __atomic_load_n(held, __ATOMIC_ACQUIRE);
@@ -351,9 +437,10 @@ static NSSize viewer_content_size(uint32_t width, uint32_t height, ViewerScale m
     manualCapture = false;
     suppressAutoHold = false;
   }
-  [self hold:active && (manualCapture || (!suppressAutoHold && at != 0 && now - at < 1500))];
+  [self hold:active && !picker && (manualCapture || (!suppressAutoHold && at != 0 && now - at < 1500))];
   static int ticks;
-  if (++ticks % 60 == 0 && kill(writer, 0) != 0) {
+  if (++ticks % 15 == 0) [self checkPicker];
+  if (ticks % 60 == 0 && kill(writer, 0) != 0) {
     [self hold:false];
     [NSApp terminate:nil];
   }
@@ -410,6 +497,7 @@ int run_viewer(const char* path) {
     view->writer = (pid_t)head->writer;
     view->frame = &head->frame;
     view->held = &head->pointer_held;
+    view->root = head->root;
     view.layer = [CALayer layer];  // a layer of the view's own, which AppKit then leaves alone
     view.wantsLayer = YES;
     view.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
@@ -455,6 +543,12 @@ int run_viewer(const char* path) {
                                                     const int32_t closed[6] = {0, 0, 0, 0, 0, 0};
                                                     (void)write(STDOUT_FILENO, closed, sizeof closed);
                                                     [NSApp terminate:nil];
+                                                  }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowDidResignKeyNotification
+                                                      object:window
+                                                       queue:nil
+                                                  usingBlock:^(NSNotification* note) {
+                                                    [view resignedKey];
                                                   }];
     // Twice a screen's usual refresh rate; a tick with nothing new costs nothing.
     NSTimer* timer = [NSTimer timerWithTimeInterval:1.0 / 120 target:view selector:@selector(tick:) userInfo:nil repeats:YES];

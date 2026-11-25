@@ -36,6 +36,7 @@ add_executable(cocaine
   src/session/session.cpp
   src/session/art.cpp
   src/viewer/viewer.mm
+  src/viewer/picker.mm
   src/kernel/threads.cpp
   src/kernel/processes.cpp
   src/kernel/signals.cpp
@@ -64,8 +65,8 @@ set_source_files_properties(
   src/cpu/x86/sse.cpp
   PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-frounding-math")
 
-set_source_files_properties(src/viewer/viewer.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
-target_link_libraries(cocaine PRIVATE "-framework CoreFoundation" "-framework IOKit" "-framework Cocoa" "-framework QuartzCore" "-framework CoreGraphics" "-framework ImageIO" "-framework OpenGL" "-framework OpenAL" "-framework AudioToolbox" "-framework AudioUnit" "-framework CoreAudio")
+set_source_files_properties(src/viewer/viewer.mm src/viewer/picker.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+target_link_libraries(cocaine PRIVATE "-framework CoreFoundation" "-framework IOKit" "-framework Cocoa" "-framework UniformTypeIdentifiers" "-framework QuartzCore" "-framework CoreGraphics" "-framework ImageIO" "-framework OpenGL" "-framework OpenAL" "-framework AudioToolbox" "-framework AudioUnit" "-framework CoreAudio")
 
 enable_testing()
 add_executable(guest-memory-test tests/guest-memory.cpp src/mem/guest_memory.cpp)
@@ -89,6 +90,16 @@ set_source_files_properties(tests/viewer-resize.mm PROPERTIES COMPILE_OPTIONS "-
 target_link_libraries(viewer-resize-test PRIVATE "-framework Cocoa" "-framework QuartzCore" "-framework CoreGraphics")
 add_test(NAME viewer-resize COMMAND viewer-resize-test)
 set_tests_properties(viewer-resize PROPERTIES SKIP_RETURN_CODE 77)
+# The file picker's helper: its plain functions, then the helper as a process
+# answering requests from the COCAINE_PICK_* stand-in (never a real panel).
+add_executable(picker-test tests/picker.mm src/kernel/paths.cpp src/session/art.cpp src/log.cpp)
+target_include_directories(picker-test PRIVATE src)
+set_source_files_properties(tests/picker.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-fno-exceptions;-fno-rtti")
+target_link_libraries(picker-test PRIVATE "-framework Cocoa" "-framework UniformTypeIdentifiers" "-framework CoreGraphics" "-framework ImageIO")
+add_test(NAME picker COMMAND picker-test)
+add_executable(picker-process-test tests/picker-process.cpp)
+target_include_directories(picker-process-test PRIVATE src)
+add_test(NAME picker-process COMMAND picker-process-test $<TARGET_FILE:cocaine>)
 # The ARM64 instruction encodings the PowerPC translator emits, against the
 # system's assembler.
 add_test(NAME arm64-encodings
