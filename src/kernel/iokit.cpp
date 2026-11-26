@@ -353,18 +353,21 @@ bool Process::iokit_rpc(u32 name, const KPort& port, u32 msg, u32 size, std::vec
       if (kr != KERN_SUCCESS) return code(kr);
       out.resize(want_numbers < 16 ? want_numbers : 16);
       bytes_out.resize(want_bytes < 4096 ? want_bytes : 4096);
-      Message m(be, local, id + 100);
+      const size_t padded_bytes = (bytes_out.size() + 3) & ~size_t(3);
+      size_t capacity = 40;
+      if (id == 2865) {
+        capacity = 52 + padded_bytes + 8 * out.size();
+      } else if (id == 2822) {
+        capacity = 40 + 4 * out.size();
+      } else if (id == 2823 || id == 2825) {
+        capacity = 40 + padded_bytes;
+      }
+      Message m(be, local, id + 100, false, capacity);
       m.ndr();
       m.put(KERN_SUCCESS);
       auto put_bytes = [&] {
         m.put((u32)bytes_out.size());
-        for (size_t i = 0; i < bytes_out.size(); i += 4) {
-          u8 w[4] = {};
-          for (size_t k = 0; k < 4 && i + k < bytes_out.size(); k++) w[k] = bytes_out[i + k];
-          u32 v;
-          memcpy(&v, w, 4);
-          m.put(be ? __builtin_bswap32(v) : v);  // bytes go out in order
-        }
+        m.put_bytes(bytes_out);
       };
       if (id == 2865) {
         put_bytes();
@@ -777,7 +780,11 @@ void Process::post_input_event(u32 type, s32 x, s32 y, u32 key, u32 extra, s32 m
   const bool moved = type == kMoved || type == kLeftDragged || type == kRightDragged;
   const bool held = hid_viewer_captured_ || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < hid_relative_until_;
   s32 dx = 0, dy = 0;
-  if (moved) {
+  if (type == kKeyDown || type == kKeyUp || type == kModifiersChanged) {
+    // Host keyboard events do not carry a meaningful pointer position.
+    x = hid_x_;
+    y = hid_y_;
+  } else if (moved) {
     dx = more == 1 ? (s32)key : x - hid_x_;
     dy = more == 1 ? (s32)extra : y - hid_y_;
     if (held) {  // from where the window server put the pointer (see set_pointer)
@@ -792,7 +799,7 @@ void Process::post_input_event(u32 type, s32 x, s32 y, u32 key, u32 extra, s32 m
       x = std::clamp(hid_x_ + dx, 0, (s32)w - 1);
       y = std::clamp(hid_y_ + dy, 0, (s32)h - 1);
     }
-  } else if (held && type != kKeyDown && type != kKeyUp && type != kModifiersChanged) {
+  } else if (held) {
     x = hid_x_;  // a button or the wheel, where the guest's pointer is
     y = hid_y_;
   }

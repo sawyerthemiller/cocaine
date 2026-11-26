@@ -17,8 +17,11 @@ The guest system's screen appears in a window on your Mac.
   on Leopard's own window server, with the mouse, keyboard and scroll wheel.
   Leopard draws at 1x for compatibility; the viewer handles Retina sizing
   without changing the app's coordinates.
+  Quitting from a worker thread ends the run even if the main thread is waiting.
 - **Games -** Marble Blast Gold (both halves of the universal build) plays at
   60 frames a second with music and sound; GL Golf draws its course.
+  Marble Blast can switch to fullscreen and back on 10.5.6 PowerPC, inside
+  the guest display.
   Postal 2 draws its startup warning, animated intro and menu, using a
   1024 x 768 display with doubled viewer pixels where they fit. Compressed
   font textures keep their full resolution. Snes9x HQ! displays running game
@@ -26,12 +29,25 @@ The guest system's screen appears in a window on your Mac.
   to keep its menus large and its game window on screen.
   Ghost Recon Demo's menu uses an exact 640 x 480 mode rather than drawing
   into a corner of a larger display (10.5.6 PowerPC).
+  The launcher enables legacy texture filtering for PowerPC and 32-bit Intel
+  Halo and Halo Demo, fixing unset radar filters and incomplete compressed
+  smoke textures; command-line runs can use
+  `COCAINE_GL_LEGACY_TEXTURE_FILTER=1`.
   OpenGL and OpenAL calls go to your Mac's own graphics and sound.
+  Leopard's PowerPC Chess can play several moves with spoken announcements.
 - **Sound -** VLC plays MP3s through your Mac's speakers.
+- **Copy and paste -** text, TIFF/PNG/JPEG images and files between the guest
+  and macOS while the cocaine window is open, using Leopard's Python 2.5.
+  Files already visible to both systems are shared by reference; otherwise a
+  temporary copy is made. Staged folders cannot contain absolute or
+  parent-relative symbolic links.
 - **Mounted disk images -** browsable images mounted under `/Volumes` are
   visible to guests, including to installers that look for a CD.
 - **Command line tools, shells and scripting languages -** from Leopard -
   `ls`, `bash`, `zsh`, Python 2.5, Perl, Ruby and the rest.
+- **Basic networking -** sockets use the Mac's network. If the guest has no
+  resolver configuration, read-only opens use a private snapshot of the Mac's
+  `/var/run/resolv.conf`.
 
 The cocaine window follows guest display resolution changes. Its View menu has
 Actual Size (one guest pixel per Mac point), Integer Scale (whole screen pixels)
@@ -53,7 +69,10 @@ setting up and running for you, in three tabs
   display and doubled viewer pixels where they fit, unless `COCAINE_DISPLAY`
   or `COCAINE_VIEWER_DOUBLE` was set explicitly. OpenGL apps run at up to
   120 frames a second by default to reduce input latency, at the cost of more
-  power; `COCAINE_GL_FPS=60` restores the previous limit. Press Command-Option-M in
+  power; `COCAINE_GL_FPS=60` restores the previous limit. For games that work
+  well with it, View > Low Latency shows frames before the pacing wait
+  instead of after it; it can be changed while the game is running.
+  `COCAINE_GL_LOW_LATENCY=1` enables it at startup. Press Command-Option-M in
   the guest window to capture or release the mouse; capture also releases
   when the window loses focus.
 
@@ -81,7 +100,9 @@ It still needs the build tools below. You can build it yourself with `gui/build.
 - Classic PowerPC PEF/CFM support is experimental. EV Nova 1.0.0 initializes
   its registration tool, but the tested scenario files report a checksum mismatch.
   Ghost Recon Demo reaches gameplay, with mouse capture available. The menu
-  can be cropped unless the display starts at 800 x 600.
+  can be cropped unless the display starts at 800 x 600. Halo Demo reaches
+  gameplay; foliage, radar, gun smoke and held-key camera jumps after respawn
+  are fixed.
 
 ## Building and running
 
@@ -129,7 +150,8 @@ A few settings, as environment variables:
 | `COCAINE_DISPLAY=1280x1024` | the guest's screen size (a conventional resolution fitting your Mac's available logical desktop by default; 1280 x 800 without a screen) |
 | `COCAINE_UI_SCALE=2` | opt into Leopard's unfinished enlarged drawing (1 by default; higher values can break old apps) |
 | `COCAINE_VIEWER_SCALE=fit` | viewer sizing - `actual` (default), `integer` or `fit`; doesn't change guest coordinates |
-| `COCAINE_GL_FPS=0` | lift the 120 frames a second cap on games |
+| `COCAINE_GL_FPS=0` | lift the 120 frames a second cap on games; this may use much more CPU and power |
+| `COCAINE_GL_LOW_LATENCY=1` | enable View > Low Latency at startup; the usual timing remains the default |
 | `COCAINE_WALLPAPER=/path/to/picture.jpg` | the desktop picture, a JPEG or PNG (`images/linen.jpeg` by default - `none` for Leopard's plain grey) |
 | `COCAINE_MENU_LOGO=apple` | keep Apple's logo in the menu bar instead of cocaine's |
 | `COCAINE_NO_VIEWER=1` | run without the window |
@@ -158,7 +180,12 @@ and apps are tested on both CPUs too.
 - QuickTime, and video in VLC.
 - File dialogs in Carbon apps - they answer cancel. iCloud Drive can't be picked from.
 - The Dock and Finder - apps can't yet start other apps.
-- Copy and paste between apps.
+- Copy and paste of RTFD attachments and other clipboard formats beyond plain
+  text, RTF, HTML, TIFF/PNG/JPEG images and files.
+- Some routing socket operations remain unsupported. Safari 3.1.2 starts and
+  attempts connections, but its default page failed in an earlier headless test.
+  The resolver fallback does not cover all VPN or split-DNS configurations,
+  and old browsers may not support modern sites' TLS requirements.
 - The tools `ps` and `top`.
 - Only one window for the whole guest screen.
 

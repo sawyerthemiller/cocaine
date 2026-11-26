@@ -37,7 +37,9 @@ environment variables, none of which change anything unless set:
 | `COCAINE_FAULT_MEM=r6:160,@2eebd0:16` | when a PowerPC guest crashes, also print memory at those registers or addresses (the crash report always names the library each caller is in) |
 | `COCAINE_NAN=1` | report the first places a PowerPC guest's floating point arithmetic makes a NaN out of numbers, with the inputs (interpreted, so slow) |
 | `COCAINE_GL_FRAME=n:file` | save OpenGL frame n, as cocaine read it back from the Mac's GPU, to `file` (raw, A R G B, bottom row first) |
+| `COCAINE_GL_LEGACY_TEXTURE_FILTER=1` | newly created 2D textures default to linear minification; DXT 2D textures clamp their maximum mip level to the supplied contiguous chain, within the guest's requested maximum. Explicit minification/magnification filters remain unchanged. Fixes Halo's radar and dark gun-smoke blocks. The launcher enables it for PowerPC and 32-bit Intel Halo/Halo Demo, including app bundles and universal binaries, unless this variable is already set |
 | `COCAINE_GL_FPS=60` | the most frames a second an OpenGL game is shown at (120 unless set; 0 for no limit) |
+| `COCAINE_GL_LOW_LATENCY=1` | enable View > Low Latency at startup; leave unset for the usual timing. The menu changes it for the running session |
 | `COCAINE_DISPLAY=1280x1024` | the guest display's size (largest conventional mode fitting the host's available logical desktop, allowing room for the viewer's frame; 1280 x 800 with no screen). Resolved once and inherited by the session. Postal 2 keeps its 1024 x 768 default and Snes9x HQ! its 1280 x 800, with doubled viewer pixels; the launcher keeps Ghost Recon Demo at 800 x 600. Tests use 1280 x 1024 |
 | `COCAINE_WALLPAPER=path` | the guest's desktop picture, a JPEG or PNG on this Mac (`images/linen.jpeg` by default, else Leopard's `DefaultDesktop.jpg`); `none` leaves the window server's plain grey (see `src/kernel/wallpaper.cpp`) |
 | `COCAINE_MENU_LOGO=apple` | keep Apple's logo in the guest's menu bar instead of cocaine's (a pile of powder, drawn in each logo's colour into a copy of Leopard's art file, `.cocaine/art/` in the system root; see `src/session/art.cpp`) |
@@ -64,7 +66,9 @@ and the emulated program must print exactly what the reference prints, bit
 for bit. Each is run twice, translated and interpreted, and each way must
 match. A second, quick test checks every ARM64 instruction the translators
 can emit against the system's assembler
-(`tests/a64-check.sh`). There are three kinds of reference:
+(`tests/a64-check.sh`). The `ppc-fpscr` test compares translated and
+interpreted FPSCR saves and restores across field masks and rounding modes.
+There are three kinds of reference:
 
 - Plain C tests (`t_int`, `t_fp`, `t_fma`, `t_signal`) are built natively for
   this Mac. `t_signal` interrupts a long calculation with a timer's signals
@@ -88,6 +92,9 @@ call what Carbon asks, and `save.py` saves Cocoa documents (PyObjC, no
 window) onto files that already exist, with a backup, and over a file with
 an access control list. Both work in the guest system's own Library; give
 either a folder name as its argument to run it somewhere else.
+
+`speech.py` checks that two spoken messages finish without a main run loop;
+the test runner also checks that the audio contains nonzero samples.
 Three of Apple's daemons are tested through their clients: the guest system
 must know the person running the tests by name, and one program must hear a
 notification that another posts (`tests/guest/notify.sh`). And Calculator is

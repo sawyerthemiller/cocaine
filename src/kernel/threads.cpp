@@ -46,13 +46,16 @@ void Process::start_thread(Thread* t) {
       exited_ = true;
       kcv_.notify_all();
     }
-    t->done = true;
     // The thread's port dies with it, as the real one would: anyone still
     // holding a reference is left with a dead name.
-    std::lock_guard<std::mutex> lk(kmu_);
-    if (kports_.erase(t->self_port)) {
-      mach_port_mod_refs(mach_task_self(), t->self_port, MACH_PORT_RIGHT_RECEIVE, -1);
+    {
+      std::lock_guard<std::mutex> lk(kmu_);
+      t->done = true;
+      if (kports_.erase(t->self_port)) {
+        mach_port_mod_refs(mach_task_self(), t->self_port, MACH_PORT_RIGHT_RECEIVE, -1);
+      }
     }
+    kcv_.notify_all();
   }).detach();
 }
 

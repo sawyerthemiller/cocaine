@@ -41,7 +41,7 @@ feature or gap changes, update the README's short lists too.
 
 ```bash
 cmake -S . -B build -G Ninja && cmake --build build
-ctest --test-dir build --output-on-failure      # about 4 minutes; 129 guest checks
+ctest --test-dir build --output-on-failure      # about 4 minutes; 149 guest checks
 ```
 
 Filter the user's Mac tweak noise (`AppleSharpener`, `BlurTweak`) out of
@@ -50,7 +50,7 @@ interpreted; `t_x87`/`t_sse` compare against Rosetta, and if Rosetta's
 `oahd` hangs they get stuck: count stuck processes with
 `ps -ax -o stat,command | grep '\.host' | grep -c '^U'`. `tests/run.sh` sets
 `COCAINE_DISPLAY=1280x1024`. Look at `build/Testing/Temporary/LastTest.log`
-for the per-test lines (`129 passed, 0 failed`).
+for the per-test lines (`149 passed, 0 failed`).
 
 ## Running guests without looking at them
 
@@ -98,6 +98,10 @@ error such as IOKit's `kNotFound`.
   "no such service". configd was added on 2026-11-18 after the Apple menu
   crashed in SCPreferences without it. Leopard 10.5.6's window server needs
   `hidd` and waits for `com.apple.iohideventsystem` until it starts.
+- `pboard` supplies the guest session's pasteboard; lookups wait until it
+  checks in so its shared memory exists before clients use it. The viewer's
+  clipboard bridge connects text, images and files to macOS using a guest
+  Python 2.5 helper.
 - `kExtraArguments`: configd runs with `-b` (no plug-ins: they'd manage the
   Mac's real network, power, Bluetooth) and `-d` (stay in the foreground: it
   only does so for launchd as pid 1, and guests see the session server's pid).

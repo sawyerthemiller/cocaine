@@ -65,15 +65,20 @@ std::vector<Entry> build_table(Arch arch) {
       {"hw.pagesize", 6, 7, I, 4096, ""},
       {"hw.machine_arch", 6, 12, T, 0, ppc ? "ppc" : "i386"},
       {"hw.vectorunit", 6, 13, I, 1, ""},
-      {"hw.busfrequency", 6, 14, I, ppc ? 133000000u : 664000000u, ""},
-      {"hw.cpufrequency", 6, 15, I, ppc ? 1250000000u : 2000000000u, ""},
+      // Named frequency queries return 64-bit values; the older numeric
+      // interfaces return 32-bit values.
+      {"hw.busfrequency", -1, 0, Q, ppc ? 133000000u : 664000000u, ""},
+      {"hw.cpufrequency", -1, 0, Q, ppc ? 1250000000u : 2000000000u, ""},
+      {nullptr, 6, 14, I, ppc ? 133000000u : 664000000u, ""},
+      {nullptr, 6, 15, I, ppc ? 1250000000u : 2000000000u, ""},
       {"hw.cachelinesize", 6, 16, I, ppc ? 32u : 64u, ""},
       {"hw.l1icachesize", 6, 17, I, 32768, ""},
       {"hw.l1dcachesize", 6, 18, I, 32768, ""},
       {"hw.l2settings", 6, 19, I, 1, ""},
       {"hw.l2cachesize", 6, 20, I, ppc ? 262144u : 2097152u, ""},
       {"hw.l3cachesize", 6, 22, I, 0u, ""},
-      {"hw.tbfrequency", 6, 23, I, 1000000000u, ""},  // the time base ticks in nanoseconds here
+      {"hw.tbfrequency", -1, 0, Q, 1000000000u, ""},  // the time base ticks in nanoseconds here
+      {nullptr, 6, 23, I, 1000000000u, ""},
       {"hw.memsize", 6, 24, Q, kMemory, ""},
       {"hw.availcpu", 6, 25, I, 2, ""},
       // Names with no fixed number.
@@ -87,10 +92,10 @@ std::vector<Entry> build_table(Arch arch) {
       {"hw.cpusubtype", -1, 0, I, ppc ? 10u : 4u, ""},
       {"hw.cpufamily", -1, 0, I, ppc ? 0x77C184AEu : 0x73D67300u, ""},  // G4, or Core Duo
       {"hw.cpu64bit_capable", -1, 0, I, 0, ""},
-      {"hw.busfrequency_min", -1, 0, I, ppc ? 133000000u : 664000000u, ""},
-      {"hw.busfrequency_max", -1, 0, I, ppc ? 133000000u : 664000000u, ""},
-      {"hw.cpufrequency_min", -1, 0, I, ppc ? 1250000000u : 2000000000u, ""},
-      {"hw.cpufrequency_max", -1, 0, I, ppc ? 1250000000u : 2000000000u, ""},
+      {"hw.busfrequency_min", -1, 0, Q, ppc ? 133000000u : 664000000u, ""},
+      {"hw.busfrequency_max", -1, 0, Q, ppc ? 133000000u : 664000000u, ""},
+      {"hw.cpufrequency_min", -1, 0, Q, ppc ? 1250000000u : 2000000000u, ""},
+      {"hw.cpufrequency_max", -1, 0, Q, ppc ? 1250000000u : 2000000000u, ""},
       {"hw.optional.floatingpoint", -1, 0, I, 1, ""},
       {"hw.optional.altivec", -1, 0, I, ppc ? 1u : 0u, ""},
       {"hw.optional.graphicsops", -1, 0, I, ppc ? 1u : 0u, ""},
@@ -172,7 +177,7 @@ SysRet Process::sys_sysctl(u32 name, u32 namelen, u32 oldp, u32 oldlenp, u32 new
     text.assign((const char*)mem_.host(newp), newlen);
     while (!text.empty() && text.back() == 0) text.pop_back();
     for (size_t i = 0; i < table.size(); i++) {
-      if (text != table[i].name) continue;
+      if (!table[i].name || text != table[i].name) continue;
       u32 out[2];
       out[0] = (u32)(table[i].mib0 < 0 ? kNamedBase : table[i].mib0);
       out[1] = (u32)(table[i].mib0 < 0 ? (int)i : table[i].mib1);

@@ -850,6 +850,10 @@ class Translator : Emitter {
       e(addw_i(rd, rn, u));
     } else if (neg < 4096) {
       e(subw_i(rd, rn, neg));
+    } else if ((u & 0xFFF) == 0 && (u >> 12) < 4096) {
+      e(addw_i(rd, rn, u >> 12, true));
+    } else if ((neg & 0xFFF) == 0 && (neg >> 12) < 4096) {
+      e(subw_i(rd, rn, neg >> 12, true));
     } else {
       imm(S1, u);
       e(addw(rd, rn, S1));
@@ -1162,6 +1166,32 @@ class Translator : Emitter {
     if (!f.native) {
       if (!result) return;
       if (b < 0) {
+        if (which == 0) {
+          add_imm(T1, a, constant);
+          return;
+        }
+        if (which == 5) {
+          add_imm(T1, a, 0u - constant);
+          return;
+        }
+        if (which == 1 || which == 4 || which == 6) {
+          if (constant == 0) {
+            if (which == 4) e(movzw(T1, 0));
+            else e(movw(T1, a));
+            return;
+          }
+          if (constant == 0xFFFFFFFFu) {
+            if (which == 1) e(mvnw(T1, ZR));
+            else if (which == 4) e(movw(T1, a));
+            else e(mvnw(T1, a));
+            return;
+          }
+          if (const Mask m = mask32(constant); m.ok) {
+            e(which == 1 ? orrw_i(T1, a, m) : which == 4 ? andw_i(T1, a, m)
+                                                       : eorw_i(T1, a, m));
+            return;
+          }
+        }
         imm(T2, constant);
         b = T2;
       }
@@ -1176,22 +1206,58 @@ class Translator : Emitter {
     }
     const bool sum = which == 0, diff = which == 5 || which == 7;
     if (sz == 4) {
-      if ((sum || diff) && b < 0 && constant < 4096) {
-        e(sum ? addsw_i(T1, a, constant) : which == 5 ? subsw_i(T1, a, constant) : cmpw_i(a, constant));
+      const bool shifted = constant >= 4096 && (constant & 0xFFF) == 0 && (constant >> 12) < 4096;
+      if ((sum || diff) && b < 0 && (constant < 4096 || shifted)) {
+        const u32 value = shifted ? constant >> 12 : constant;
+        if (sum) e(addsw_i(T1, a, value, shifted));
+        else e(subsw_i(which == 5 ? T1 : ZR, a, value, shifted));
       } else {
-        if (b < 0) {
-          imm(T2, constant);
-          b = T2;
-        }
-        switch (which) {
-          case 0: e(addsw(T1, a, b)); break;
-          case 5: e(subsw(T1, a, b)); break;
-          case 7: e(cmpw(a, b)); break;
-          case 4: e(andsw(T1, a, b)); break;
-          default:
-            e(which == 1 ? orrw(T1, a, b) : eorw(T1, a, b));
+        bool direct = false;
+        if (b < 0 && which == 4) {
+          if (const Mask m = mask32(constant); m.ok) {
+            if (result) {
+              e(andw_i(T1, a, m));
+              e(tstw(T1, T1));
+            } else {
+              e(tstw_i(a, m));
+            }
+            direct = true;
+          } else if (constant == 0) {
+            e(andsw(result ? T1 : ZR, a, ZR));
+            direct = true;
+          } else if (constant == 0xFFFFFFFFu) {
+            e(andsw(result ? T1 : ZR, a, a));
+            direct = true;
+          }
+        } else if (b < 0 && (which == 1 || which == 6)) {
+          if (constant == 0) {
+            e(andsw(T1, a, a));
+            direct = true;
+          } else if (constant == 0xFFFFFFFFu) {
+            e(which == 1 ? mvnw(T1, ZR) : mvnw(T1, a));
             e(tstw(T1, T1));
-            break;
+            direct = true;
+          } else if (const Mask m = mask32(constant); m.ok) {
+            e(which == 1 ? orrw_i(T1, a, m) : eorw_i(T1, a, m));
+            e(tstw(T1, T1));
+            direct = true;
+          }
+        }
+        if (!direct) {
+          if (b < 0) {
+            imm(T2, constant);
+            b = T2;
+          }
+          switch (which) {
+            case 0: e(addsw(T1, a, b)); break;
+            case 5: e(subsw(T1, a, b)); break;
+            case 7: e(cmpw(a, b)); break;
+            case 4: e(andsw(T1, a, b)); break;
+            default:
+              e(which == 1 ? orrw(T1, a, b) : eorw(T1, a, b));
+              e(tstw(T1, T1));
+              break;
+          }
         }
       }
     } else if (sum || diff || which == 4) {
@@ -1535,16 +1601,29 @@ bool Translator::one(const Ins& n) {
       const bool dead = flags_dead(n);
       if (!dead) ensure();
       const int v = rm_load(n, 4, T1);
-      int by = G(n.reg);
       if (n.kind == kImul3) {
-        imm(T2, n.imm);
-        by = T2;
+        const u32 factor = (u32)n.imm;
+        const int d = G(n.reg);
+        if (dead && factor == 0) {
+          e(movzw(d, 0));
+        } else if (dead && factor == 1) {
+          if (d != v) e(movw(d, v));
+        } else if (dead && factor == 0xFFFFFFFFu) {
+          e(negw(d, v));
+        } else if (dead && (factor & (factor - 1)) == 0) {
+          e(lslw_i(d, v, __builtin_ctz(factor)));
+        } else {
+          imm(T2, factor);
+          e(dead ? mulw(d, v, T2) : smull(0, v, T2));
+        }
+      } else if (dead) {
+        e(mulw(G(n.reg), v, G(n.reg)));
+      } else {
+        e(smull(0, v, G(n.reg)));
       }
       if (dead) {
-        e(mulw(G(n.reg), v, by));
         poison();
       } else {
-        e(smull(0, v, by));
         imul_flags();
         e(movw(G(n.reg), 0));
       }

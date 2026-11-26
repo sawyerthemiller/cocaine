@@ -170,6 +170,75 @@ bool system_root_file(const std::string& host, const std::string& root) {
 
 }  // namespace
 
+int Process::open_resolver_config(const std::string& host, int flags) {
+  if (opt_.sysroot.empty() || host != opt_.sysroot + "/private/var/run/resolv.conf" ||
+      (flags & ~O_CLOEXEC) != O_RDONLY) {
+    errno = ENOENT;
+    return -1;
+  }
+  // A dangling guest symlink is an explicit configuration, not a missing file.
+  struct stat st;
+  if (lstat(host.c_str(), &st) == 0) {
+    errno = ENOENT;
+    return -1;
+  }
+  if (errno != ENOENT) return -1;
+  int source = open("/var/run/resolv.conf", O_RDONLY);
+  if (source < 0) {
+    log_warn("cannot open host resolver configuration: %s", strerror(errno));
+    return -1;
+  }
+  char tmp[PATH_MAX];
+  if (!confstr(_CS_DARWIN_USER_TEMP_DIR, tmp, sizeof tmp)) {
+    close(source);
+    errno = EIO;
+    return -1;
+  }
+  std::string name = std::string(tmp) + "cocaine-resolv-XXXXXX";
+  int fd = mkstemp(name.data());
+  if (fd < 0) {
+    const int err = errno;
+    close(source);
+    errno = err;
+    return -1;
+  }
+  auto fail = [&](int err) {
+    close(source);
+    close(fd);
+    if (unlink(name.c_str()) != 0)
+      log_warn("cannot remove temporary resolver configuration %s: %s", name.c_str(), strerror(errno));
+    errno = err;
+    return -1;
+  };
+  std::array<char, 4096> data;
+  for (;;) {
+    const ssize_t n = read(source, data.data(), data.size());
+    if (n < 0) return fail(errno);
+    if (n == 0) break;
+    size_t written = 0;
+    while (written < (size_t)n) {
+      const ssize_t w = write(fd, data.data() + written, (size_t)n - written);
+      if (w <= 0) return fail(w < 0 ? errno : EIO);
+      written += (size_t)w;
+    }
+  }
+  int reader = open(name.c_str(), O_RDONLY | (flags & O_CLOEXEC));
+  if (reader < 0) return fail(errno);
+  struct stat written, opened;
+  if (fstat(fd, &written) != 0 || fstat(reader, &opened) != 0) {
+    const int err = errno; close(reader); return fail(err);
+  }
+  if (written.st_dev != opened.st_dev || written.st_ino != opened.st_ino) {
+    close(reader); return fail(EIO);
+  }
+  if (unlink(name.c_str()) != 0) {
+    const int err = errno; close(reader); close(source); close(fd); errno = err; return -1;
+  }
+  close(source);
+  close(fd);
+  return reader;
+}
+
 int Process::open_appledouble_fork(const std::string& host, int flags) {
   static const std::string suffix = "/..namedfork/rsrc";
   if (!in_system_root(host, opt_.sysroot) || host.size() <= suffix.size() ||
@@ -404,18 +473,20 @@ SysRet Process::sys_getattrlist(const std::string& path, u32 list, u32 buf, u32 
   const std::string host = host_path(path, follow);
   std::vector<u8> in(16384);
   if (getattrlist(host.c_str(), &al, in.data(), in.size(), options) != 0) return SysRet::err(errno);
-  // Carbon walks parent IDs through /.vol; the imported root represents the
-  // guest's volume root (ID 2), not its physical parent on the host.
-  if ((al.commonattr & ATTR_CMN_PAROBJID) && !opt_.sysroot.empty() &&
-      host.rfind('/') == opt_.sysroot.size() &&
-      host.compare(0, opt_.sysroot.size(), opt_.sysroot) == 0) {
+  // Carbon walks IDs through /.vol; the imported root is volume root ID 2.
+  const bool imported_root = !opt_.sysroot.empty() && host == opt_.sysroot;
+  const bool root_child = !opt_.sysroot.empty() &&
+                          host.rfind('/') == opt_.sysroot.size() &&
+                          host.compare(0, opt_.sysroot.size(), opt_.sysroot) == 0;
+  if ((imported_root || root_child) &&
+      (al.commonattr & (ATTR_CMN_OBJID | ATTR_CMN_PAROBJID))) {
     size_t at = 4;
     for (const AttrDef& d : kCommon) {
       if (!(al.commonattr & d.bit)) continue;
-      if (d.bit == ATTR_CMN_PAROBJID) {
+      if ((imported_root && d.bit == ATTR_CMN_OBJID) ||
+          d.bit == ATTR_CMN_PAROBJID) {
         const u32 root_id[2] = {2, 0};
         memcpy(in.data() + at, root_id, sizeof root_id);
-        break;
       }
       at += host_size(d.type);
     }
@@ -423,6 +494,20 @@ SysRet Process::sys_getattrlist(const std::string& path, u32 list, u32 buf, u32 
   struct stat st;
   const bool have_stat = (follow ? stat(host.c_str(), &st) : lstat(host.c_str(), &st)) == 0;
   const bool is_dir = have_stat && S_ISDIR(st.st_mode);
+  bool root_entry = !opt_.sysroot.empty() && (path == "/" || host == opt_.sysroot);
+  if (!opt_.sysroot.empty() && !root_entry && have_stat &&
+      ((al.commonattr & ATTR_CMN_NAME) || (al.volattr & ATTR_VOL_INFO))) {
+    struct stat slash;
+    if (stat("/", &slash) != 0) return SysRet::err(errno);
+    root_entry = st.st_dev == slash.st_dev && st.st_ino == slash.st_ino;
+  }
+  bool root_volume = root_entry;
+  if (!opt_.sysroot.empty() && !root_volume && (al.volattr & ATTR_VOL_INFO)) {
+    if (!have_stat) return SysRet::err(errno);
+    struct stat root_stat;
+    if (stat(opt_.sysroot.c_str(), &root_stat) != 0) return SysRet::err(errno);
+    root_volume = st.st_dev == root_stat.st_dev;
+  }
   if (have_stat && S_ISREG(st.st_mode) && system_root_file(host, opt_.sysroot) &&
       ((al.commonattr & ATTR_CMN_FNDRINFO) || (al.fileattr & (ATTR_FILE_RSRCLENGTH | ATTR_FILE_RSRCALLOCSIZE)))) {
     bool finder_missing = false, fork_missing = false;
@@ -469,18 +554,25 @@ SysRet Process::sys_getattrlist(const std::string& path, u32 list, u32 buf, u32 
 
   // The attributes present, in the order both sides lay them out. Directory
   // attributes come back only for directories, file attributes only for files.
-  std::vector<AttrType> fields;
+  struct Field {
+    AttrType type;
+    bool root_name;
+  };
+  std::vector<Field> fields;
   size_t acl_field = SIZE_MAX;  // which of them is the access control list, if asked for
   for (const AttrDef& d : kCommon) {
     if (!(al.commonattr & d.bit)) continue;
     if (d.bit == ATTR_CMN_EXTENDED_SECURITY) acl_field = fields.size();
-    fields.push_back(d.type);
+    fields.push_back({d.type, d.bit == ATTR_CMN_NAME &&
+                               ((al.volattr & ATTR_VOL_INFO) ? root_volume : root_entry)});
   }
-  for (const AttrDef& d : kVolume) if (al.volattr & d.bit) fields.push_back(d.type);
+  for (const AttrDef& d : kVolume) {
+    if (al.volattr & d.bit) fields.push_back({d.type, d.bit == ATTR_VOL_NAME && root_volume});
+  }
   if (is_dir) {
-    for (const AttrDef& d : kDir) if (al.dirattr & d.bit) fields.push_back(d.type);
+    for (const AttrDef& d : kDir) if (al.dirattr & d.bit) fields.push_back({d.type, false});
   } else {
-    for (const AttrDef& d : kFile) if (al.fileattr & d.bit) fields.push_back(d.type);
+    for (const AttrDef& d : kFile) if (al.fileattr & d.bit) fields.push_back({d.type, false});
   }
 
   const bool be = mem_.big_endian();
@@ -500,13 +592,15 @@ SysRet Process::sys_getattrlist(const std::string& path, u32 list, u32 buf, u32 
     size_t guest_ref;  // where the guest's offset/length pair sits
     size_t host_data;  // where the host put the data
     u32 length;
+    bool root_name;
   };
   std::vector<Pending> pending;
   size_t acl_ref = SIZE_MAX;  // the access control list's reference, in `out`
-  size_t hp = 4, field = 0;
-  for (AttrType t : fields) {
+  size_t hp = 4, index = 0;
+  for (const Field& field : fields) {
+    const AttrType t = field.type;
     const size_t gp = out.size();
-    if (field++ == acl_field) acl_ref = gp;
+    if (index++ == acl_field) acl_ref = gp;
     switch (t) {
       case kU32:
         put32(out, gp, get32(hp));
@@ -531,7 +625,7 @@ SysRet Process::sys_getattrlist(const std::string& path, u32 list, u32 buf, u32 
       }
       case kRef: {
         const s32 offset = (s32)get32(hp);
-        pending.push_back({gp, (size_t)((s64)hp + offset), get32(hp + 4)});
+        pending.push_back({gp, (size_t)((s64)hp + offset), get32(hp + 4), field.root_name});
         put32(out, gp, 0);
         put32(out, gp + 4, 0);
         break;
@@ -550,7 +644,11 @@ SysRet Process::sys_getattrlist(const std::string& path, u32 list, u32 buf, u32 
   // Variable-length data follows the fixed part, each piece padded to 4 bytes.
   for (const Pending& p : pending) {
     const size_t at = out.size();
-    if (p.host_data + p.length <= in.size()) {
+    constexpr char kRootName[] = "Macintosh HD";
+    const u32 length = p.root_name ? sizeof kRootName : p.length;
+    if (p.root_name) {
+      out.insert(out.end(), kRootName, kRootName + sizeof kRootName);
+    } else if (p.host_data + p.length <= in.size()) {
       out.insert(out.end(), in.begin() + (long)p.host_data, in.begin() + (long)(p.host_data + p.length));
       // A PowerPC guest reads the list's numbers the other way round.
       if (be && p.guest_ref == acl_ref && p.length >= KAUTH_FILESEC_SIZE(0)) {
@@ -561,7 +659,7 @@ SysRet Process::sys_getattrlist(const std::string& path, u32 list, u32 buf, u32 
     }
     while (out.size() % 4) out.push_back(0);
     put32(out, p.guest_ref, (u32)(at - p.guest_ref));
-    put32(out, p.guest_ref + 4, p.length);
+    put32(out, p.guest_ref + 4, length);
   }
   put32(out, 0, (u32)out.size());
   memcpy(mem_.host(buf), out.data(), out.size() < size ? out.size() : size);

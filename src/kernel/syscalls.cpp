@@ -9,10 +9,12 @@
 #include <mach/mach.h>
 #include <poll.h>
 #include <sys/event.h>
+#include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/select.h>
+#include <sys/sockio.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/uio.h>
@@ -635,26 +637,40 @@ SysRet Process::bsd_syscall(Thread& t, u32 num, SysArgs& a) {
 
   SysRet r = SysRet::err(ENOSYS);
   switch (num) {
-    case 1:  // exit
-      exit_code_ = a.i() & 0xFF;
-      exited_ = true;
-      kcv_.notify_all();
-      r = SysRet::none();
-      break;
+    case 1: {  // exit
+      const int status = a.i() & 0xFF;
+      // Another guest thread may be blocked in a host call indefinitely.
+      // End the whole host process, without tearing memory down under it.
+      report_stats();
+      fflush(nullptr);
+      _exit(status);
+    }
 
     // ---- files ----
     case 3:
     case 396: {  // read
       const int fd = a.i();
       const u32 buf = a.u(), n = a.u();
-      r = mem_.range_ok(buf, n) ? result(::read(fd, mem_.host(buf), n)) : SysRet::err(EFAULT);
+      if (!mem_.range_ok(buf, n)) {
+        r = SysRet::err(EFAULT);
+      } else {
+        const int route = mem_.big_endian() ? route_socket(fd) : 0;
+        r = route < 0 ? SysRet::err(-route) : route ? sys_route_io(fd, buf, n, false)
+                                                   : result(::read(fd, mem_.host(buf), n));
+      }
       break;
     }
     case 4:
     case 397: {  // write
       const int fd = a.i();
       const u32 buf = a.u(), n = a.u();
-      r = mem_.range_ok(buf, n) ? result(::write(fd, mem_.host(buf), n)) : SysRet::err(EFAULT);
+      if (!mem_.range_ok(buf, n)) {
+        r = SysRet::err(EFAULT);
+      } else {
+        const int route = mem_.big_endian() ? route_socket(fd) : 0;
+        r = route < 0 ? SysRet::err(-route) : route ? sys_route_io(fd, buf, n, true)
+                                                   : result(::write(fd, mem_.host(buf), n));
+      }
       break;
     }
     case 153:
@@ -713,7 +729,10 @@ SysRet Process::bsd_syscall(Thread& t, u32 num, SysArgs& a) {
       } else {
         const std::string host = host_path(path);
         int fd = ::open(host.c_str(), flags, mode);
-        if (fd < 0 && errno == ENOENT) fd = open_appledouble_fork(host, flags);
+        if (fd < 0 && errno == ENOENT) {
+          fd = open_resolver_config(host, flags);
+          if (fd < 0 && errno == ENOENT) fd = open_appledouble_fork(host, flags);
+        }
         r = result(fd);
       }
       break;
@@ -779,6 +798,26 @@ SysRet Process::bsd_syscall(Thread& t, u32 num, SysArgs& a) {
         }
       } else if (request == 0x4004667A) {  // FIODTYPE: what kind of device; only disks and tapes say
         r = SysRet::err(ENOTTY);
+      } else if (request == 0x8004667E) {  // FIONBIO
+        if (!mem_.range_ok(arg, 4)) {
+          r = SysRet::err(EFAULT);
+        } else {
+          int enabled = (int)mem_.r32(arg);
+          r = result(ioctl(fd, FIONBIO, &enabled));
+        }
+      } else if (request == 0xC0206911) {  // SIOCGIFFLAGS
+        struct ifreq ifr = {};
+        static_assert(sizeof ifr == 32);
+        if (!mem_.copy_in(&ifr, arg, sizeof ifr)) {
+          r = SysRet::err(EFAULT);
+        } else if (ioctl(fd, SIOCGIFFLAGS, &ifr) != 0) {
+          r = SysRet::err(errno);
+        } else if (!mem_.copy_out(arg, &ifr, sizeof ifr)) {
+          r = SysRet::err(EFAULT);
+        } else {
+          mem_.w16(arg + 16, (u16)ifr.ifr_flags);
+          r = SysRet::ok();
+        }
       } else {
         log_warn("unimplemented ioctl 0x%08x", request);
         r = SysRet::err(ENOTTY);

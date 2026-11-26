@@ -23,6 +23,8 @@
 
 #include "viewer/picker.h"
 #include "viewer/viewer.h"
+#include "viewer/clipboard.h"
+#include "session/pacing.h"
 
 enum class ViewerScale { Actual, Integer, Fit };
 
@@ -156,6 +158,7 @@ static bool viewer_kept_from_guest(uint32_t kind) {
   bool pickerYielded;              // ... and it has been told it may come to the front
   bool sentPoint;                  // lastX and lastY are where the guest was last told the pointer is
   int32_t lastX, lastY;
+  uint32_t* pacingControl;
 }
 - (void)show;
 - (void)hold:(bool)hold;
@@ -165,6 +168,7 @@ static bool viewer_kept_from_guest(uint32_t kind) {
 - (void)chooseScale:(NSMenuItem*)item;
 - (void)checkPicker;
 - (void)resignedKey;
+- (void)toggleLowLatency:(NSMenuItem*)item;
 @end
 
 @implementation CocaineDisplayView
@@ -214,8 +218,15 @@ static bool viewer_kept_from_guest(uint32_t kind) {
   legacyPixelScale = 0;
   moveX = moveY = 0;
   for (NSMenuItem* choice in item.menu.itemArray)
-    choice.state = choice == item ? NSControlStateValueOn : NSControlStateValueOff;
+    if (!choice.isSeparatorItem && choice.action == item.action)
+      choice.state = choice == item ? NSControlStateValueOn : NSControlStateValueOff;
   [self sizeToDisplay];
+}
+- (void)toggleLowLatency:(NSMenuItem*)item {
+  if (!pacingControl) return;
+  const uint32_t value = __atomic_load_n(pacingControl, __ATOMIC_RELAXED) ? 0 : 1;
+  __atomic_store_n(pacingControl, value, __ATOMIC_RELAXED);
+  item.state = value ? NSControlStateValueOn : NSControlStateValueOff;
 }
 // Hands the layer the picture as it is now. The guest's pixels are 32 bits
 // each with the unused byte first, in the guest CPU's byte order. They are
@@ -319,7 +330,7 @@ static bool viewer_kept_from_guest(uint32_t kind) {
   sentPoint = true;
   lastX = record[1];
   lastY = record[2];
-  (void)write(STDOUT_FILENO, record, sizeof record);
+  send_viewer_input(record);
 }
 - (void)keyDown:(NSEvent*)event {
   if (picker) return;
@@ -378,7 +389,7 @@ static bool viewer_kept_from_guest(uint32_t kind) {
   moveX = moveY = 0;
   skipMove = false;
   const int32_t record[6] = {(int32_t)kViewerCaptureChanged, hold ? 1 : 0, 0, 0, 0, 0};
-  (void)write(STDOUT_FILENO, record, sizeof record);
+  send_viewer_input(record);
   self.window.title = hold ? @"cocaine: Mac OS X 10.5 - mouse captured (Cmd-Option-M to release)"
                            : @"cocaine: Mac OS X 10.5";
   if (hold) {
@@ -422,7 +433,7 @@ static bool viewer_kept_from_guest(uint32_t kind) {
 - (void)resignedKey {
   if (sentPoint) {
     const int32_t record[6] = {12, lastX, lastY, 0, 0, 0};
-    (void)write(STDOUT_FILENO, record, sizeof record);
+    send_viewer_input(record);
   }
   manualCapture = false;
   suppressAutoHold = false;
@@ -447,7 +458,8 @@ static bool viewer_kept_from_guest(uint32_t kind) {
 }
 @end
 
-int run_viewer(const char* path) {
+int run_viewer(const char* path, const std::string& session,
+               const std::string& self, const std::string& sysroot) {
   const int fd = open(path, O_RDONLY);
   struct stat st;
   if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(DisplayFileHeader)) return 1;
@@ -498,6 +510,8 @@ int run_viewer(const char* path) {
     view->frame = &head->frame;
     view->held = &head->pointer_held;
     view->root = head->root;
+    view->pacingControl = open_session_pacing(session, true, error);
+    if (!view->pacingControl) fprintf(stderr, "cocaine: low latency menu unavailable: %s\n", error.c_str());
     view.layer = [CALayer layer];  // a layer of the view's own, which AppKit then leaves alone
     view.wantsLayer = YES;
     view.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
@@ -514,6 +528,7 @@ int run_viewer(const char* path) {
     appItem.submenu = appMenu;
     NSMenuItem* viewItem = [menu addItemWithTitle:@"View" action:nil keyEquivalent:@""];
     NSMenu* viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
+    viewMenu.autoenablesItems = NO;
     NSArray<NSString*>* titles = @[@"Actual Size", @"Integer Scale", @"Fit"];
     for (NSInteger index = 0; index < (NSInteger)titles.count; index++) {
       NSMenuItem* item = [viewMenu addItemWithTitle:titles[index] action:@selector(chooseScale:)
@@ -522,6 +537,14 @@ int run_viewer(const char* path) {
       item.tag = index;
       item.state = index == (NSInteger)mode ? NSControlStateValueOn : NSControlStateValueOff;
     }
+    [viewMenu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem* latency = [viewMenu addItemWithTitle:@"Low Latency" action:@selector(toggleLowLatency:)
+                                      keyEquivalent:@""];
+    latency.target = view;
+    latency.enabled = view->pacingControl != nullptr;
+    if (view->pacingControl)
+      latency.state = __atomic_load_n(view->pacingControl, __ATOMIC_RELAXED)
+                          ? NSControlStateValueOn : NSControlStateValueOff;
     viewItem.submenu = viewMenu;
     NSApp.mainMenu = menu;
     [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowDidChangeScreenNotification
@@ -533,6 +556,7 @@ int run_viewer(const char* path) {
     window.acceptsMouseMovedEvents = YES;
     [window makeFirstResponder:view];
     signal(SIGPIPE, SIG_IGN);
+    start_clipboard_bridge(self, sysroot, session, head->big_endian != 0);
     [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification
                                                       object:window
                                                        queue:nil
@@ -549,6 +573,11 @@ int run_viewer(const char* path) {
                                                        queue:nil
                                                   usingBlock:^(NSNotification* note) {
                                                     [view resignedKey];
+                                                  }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:NSApplicationWillTerminateNotification
+                                                      object:NSApp queue:nil
+                                                  usingBlock:^(NSNotification* note) {
+                                                    stop_clipboard_bridge();
                                                   }];
     // Twice a screen's usual refresh rate; a tick with nothing new costs nothing.
     NSTimer* timer = [NSTimer timerWithTimeInterval:1.0 / 120 target:view selector:@selector(tick:) userInfo:nil repeats:YES];

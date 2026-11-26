@@ -178,13 +178,17 @@ if [ -f "$root/usr/lib/dyld" ]; then
         cat "$log"
         fail=$((fail + 1))
       fi
-      for fps in default 60 0; do
+      for fps in default 60 0 low-60 low-1 low-0; do
         log="$work/gl-pacing-$arch-$fps.log"
         if [ "$fps" = default ]; then
-          actual=$(env -u COCAINE_GL_FPS PYTHONDONTWRITEBYTECODE=1 "$cocaine" --arch "$arch" --sysroot "$root" \
+          actual=$(env -u COCAINE_GL_FPS -u COCAINE_GL_LOW_LATENCY PYTHONDONTWRITEBYTECODE=1 "$cocaine" --arch "$arch" --sysroot "$root" \
+            "$root/usr/bin/python2.5" -c "$(cat "$here/guest/gl-pacing.py")" "$fps" 2>"$log")
+        elif [ "$fps" = low-60 ] || [ "$fps" = low-1 ] || [ "$fps" = low-0 ]; then
+          actual=$(COCAINE_GL_LOW_LATENCY=1 COCAINE_GL_FPS="${fps#low-}" PYTHONDONTWRITEBYTECODE=1 \
+            "$cocaine" --arch "$arch" --sysroot "$root" \
             "$root/usr/bin/python2.5" -c "$(cat "$here/guest/gl-pacing.py")" "$fps" 2>"$log")
         else
-          actual=$(COCAINE_GL_FPS="$fps" PYTHONDONTWRITEBYTECODE=1 "$cocaine" --arch "$arch" --sysroot "$root" \
+          actual=$(env -u COCAINE_GL_LOW_LATENCY COCAINE_GL_FPS="$fps" PYTHONDONTWRITEBYTECODE=1 "$cocaine" --arch "$arch" --sysroot "$root" \
             "$root/usr/bin/python2.5" -c "$(cat "$here/guest/gl-pacing.py")" "$fps" 2>"$log")
         fi
         status=$?
@@ -198,19 +202,41 @@ if [ -f "$root/usr/lib/dyld" ]; then
           fail=$((fail + 1))
         fi
       done
-      log="$work/cgl-$arch.log"
-      actual=$(PYTHONDONTWRITEBYTECODE=1 "$cocaine" --arch "$arch" --sysroot "$root" \
-        "$root/usr/bin/python2.5" -c "$(cat "$here/guest/cgl.py")" 2>"$log")
-      status=$?
-      if [ "$status" -eq 0 ] && [ "$actual" = "CGL compatibility ok" ]; then
-        echo "ok    $arch CGL compatibility"
-        pass=$((pass + 1))
-      else
-        echo "FAIL  $arch CGL compatibility: $actual"
-        drop_noise "$log"
-        cat "$log"
-        fail=$((fail + 1))
-      fi
+      for api in agl cgl; do
+        for initial in 0 1; do
+          log="$work/gl-pacing-live-$arch-$api-$initial.log"
+          if python3 "$here/gl-pacing-live.py" "$cocaine" "$root" "$arch" "$api" "$initial" >"$log" 2>&1; then
+            echo "ok    $arch live $api pacing (initial $initial)"
+            pass=$((pass + 1))
+          else
+            echo "FAIL  $arch live $api pacing (initial $initial)"
+            cat "$log"
+            fail=$((fail + 1))
+          fi
+        done
+      done
+      for latency in 0 1 order; do
+        log="$work/cgl-$arch-$latency.log"
+        if [ "$latency" = order ]; then
+          actual=$(COCAINE_GL_LOW_LATENCY=1 COCAINE_GL_FPS=2 PYTHONDONTWRITEBYTECODE=1 \
+            "$cocaine" --arch "$arch" --sysroot "$root" \
+            "$root/usr/bin/python2.5" -c "$(cat "$here/guest/cgl.py")" pacing-order 2>"$log")
+        else
+          actual=$(env -u COCAINE_GL_FPS COCAINE_GL_LOW_LATENCY="$latency" PYTHONDONTWRITEBYTECODE=1 \
+            "$cocaine" --arch "$arch" --sysroot "$root" \
+            "$root/usr/bin/python2.5" -c "$(cat "$here/guest/cgl.py")" 2>"$log")
+        fi
+        status=$?
+        if [ "$status" -eq 0 ] && [ "$actual" = "CGL compatibility ok" ]; then
+          echo "ok    $arch CGL compatibility (low latency $latency)"
+          pass=$((pass + 1))
+        else
+          echo "FAIL  $arch CGL compatibility (low latency $latency): $actual"
+          drop_noise "$log"
+          cat "$log"
+          fail=$((fail + 1))
+        fi
+      done
       log="$work/midi-$arch.log"
       actual=$(PYTHONDONTWRITEBYTECODE=1 "$cocaine" --arch "$arch" --sysroot "$root" \
         "$root/usr/bin/python2.5" -c "$(cat "$here/guest/midi.py")" 2>"$log")
@@ -220,6 +246,21 @@ if [ -f "$root/usr/lib/dyld" ]; then
         pass=$((pass + 1))
       else
         echo "FAIL  $arch MIDI audio compatibility: $actual"
+        drop_noise "$log"
+        cat "$log"
+        fail=$((fail + 1))
+      fi
+      log="$work/speech-$arch.log"
+      audio="$(cd "$work" && pwd)/speech-$arch.raw"
+      actual=$(COCAINE_AUDIO_DUMP="$audio" PYTHONDONTWRITEBYTECODE=1 "$cocaine" --arch "$arch" --sysroot "$root" \
+        "$root/usr/bin/python2.5" -c "$(cat "$here/guest/speech.py")" 2>"$log")
+      status=$?
+      if [ "$status" -eq 0 ] && [ "$actual" = "speech audio compatibility ok" ] &&
+        python3 -c 'import array, sys; a = array.array("f"); a.frombytes(open(sys.argv[1], "rb").read()); sys.exit(not any(abs(x) > 0.001 for x in a))' "$audio"; then
+        echo "ok    $arch speech audio compatibility"
+        pass=$((pass + 1))
+      else
+        echo "FAIL  $arch speech audio compatibility: $actual"
         drop_noise "$log"
         cat "$log"
         fail=$((fail + 1))

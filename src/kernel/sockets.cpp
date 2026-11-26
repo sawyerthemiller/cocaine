@@ -4,15 +4,19 @@
 // sockets, and option values, which are integers in the guest's byte order.
 
 #include <netinet/in.h>
+#include <libproc.h>
+#include <sys/proc_info.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 
 #include "kernel/process.h"
+#include "kernel/route.h"
 
 namespace {
 
@@ -28,6 +32,43 @@ bool option_is_bytes(int level, int name) {
 }
 
 }  // namespace
+
+int Process::route_socket(int fd) const {
+  int type = 0;
+  socklen_t len = sizeof type;
+  if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0 || type != SOCK_RAW) return 0;
+  struct socket_fdinfo info = {};
+  errno = 0;
+  if (proc_pidfdinfo(getpid(), fd, PROC_PIDFDSOCKETINFO, &info, sizeof info) != sizeof info)
+    return -(errno ? errno : EIO);
+  return info.psi.soi_family == AF_ROUTE ? 1 : 0;
+}
+
+SysRet Process::sys_route_io(int fd, u32 buf, u32 len, bool writing) {
+  if (!len) return result(writing ? write(fd, mem_.host(buf), 0) : read(fd, mem_.host(buf), 0));
+  if (writing) {
+    if (len > 65535) return SysRet::err(EMSGSIZE);
+    std::vector<u8> message(len);
+    if (!mem_.copy_in(message.data(), buf, len)) return SysRet::err(EFAULT);
+    if (message.size() < 4 || (message[3] != RTM_GET && message[3] != kRouteGetSilent) ||
+        !swap_route_message(message, true)) {
+      log_warn("unsupported or malformed PowerPC routing message");
+      return SysRet::err(EINVAL);
+    }
+    return result(write(fd, message.data(), message.size()));
+  }
+  std::vector<u8> message(65535);
+  const ssize_t n = read(fd, message.data(), message.size());
+  if (n < 0) return SysRet::err(errno);
+  message.resize((size_t)n);
+  if (!swap_route_message(message, false)) {
+    log_warn("unsupported or malformed host routing message");
+    return SysRet::err(EOPNOTSUPP);
+  }
+  const size_t copied = std::min<size_t>(len, message.size());
+  if (!mem_.copy_out(buf, message.data(), copied)) return SysRet::err(EFAULT);
+  return SysRet::ok((u32)copied);
+}
 
 SysRet Process::sys_socket_call(u32 num, SysArgs& a) {
   // Reads a socket address from the guest. A Unix-domain path goes through

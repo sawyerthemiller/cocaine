@@ -165,7 +165,7 @@ int main(int argc, char** argv) {
       opt.session = value();
     } else if (a == "--view") {
       // Used by the process running the guest's window server: show its display.
-      return run_viewer(value());
+      return run_viewer(value(), opt.session, argv[0], opt.sysroot);
     } else if (a == "--pick") {
       // Used when a guest shows an open or save panel: answer its request
       // (on descriptor 3) with this Mac's file picker. --session follows.

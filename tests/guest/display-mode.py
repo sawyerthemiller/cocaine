@@ -20,6 +20,32 @@ cf.CFRelease.argtypes = [ptr]
 
 display = cg.CGMainDisplayID()
 width, height, bits, original_width, original_height = map(int, sys.argv[1:])
+dsp = ctypes.CDLL("/System/Library/Frameworks/DrawSprocket.framework/DrawSprocket")
+dsp.DSpFindBestContext.argtypes = [ptr, ctypes.POINTER(ptr)]
+dsp.DSpContext_GetAttributes.argtypes = [ptr, ptr]
+dsp.DSpContext_Reserve.argtypes = [ptr, ptr]
+dsp.DSpContext_Release.argtypes = [ptr]
+assert dsp.DSpStartup() == 0
+try:
+    for mode_width, mode_height in ((640, 480), (800, 600), (1024, 768)):
+        for depth in (16, 32):
+            # DSpContextAttributes: dimensions, color needs, depth masks,
+            # preferred depths and page count (the rest remains zero).
+            attrs = (uint * 18)()
+            attrs[1], attrs[2], attrs[5] = mode_width, mode_height, 2
+            attrs[8] = attrs[9] = 0xffffffff
+            attrs[10] = attrs[11] = depth
+            attrs[12] = 1
+            context = ptr()
+            assert dsp.DSpFindBestContext(attrs, ctypes.byref(context)) == 0
+            found = (uint * 18)()
+            assert dsp.DSpContext_GetAttributes(context, found) == 0
+            assert (found[1], found[2], found[11]) == (mode_width, mode_height, depth), (
+                mode_width, mode_height, depth, tuple(found))
+            assert dsp.DSpContext_Reserve(context, attrs) == 0
+            assert dsp.DSpContext_Release(context) == 0
+finally:
+    dsp.DSpShutdown()
 original = cg.CGDisplayCurrentMode(display)
 assert original
 cf.CFRetain(original)
