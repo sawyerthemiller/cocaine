@@ -32,6 +32,7 @@
 #include "kernel/display_pixels.h"
 #include "kernel/tunnel.h"
 #include "session/pacing.h"
+#include "viewer/picker.h"
 #include "viewer/viewer.h"
 
 #include <fcntl.h>
@@ -594,6 +595,9 @@ void Process::share_display(u32 addr, u64 shared_bytes) {
   // The session's root, for the viewer to find the file picker's flag by.
   int session_root = 0;
   if (sscanf(opt_.session.c_str(), "cocaine.session.%d.", &session_root) != 1 || session_root < 0) session_root = 0;
+  // A helper that was killed leaves its flag behind, and a new session can
+  // be given an old one's number: no panel is up before there is a display.
+  if (session_root > 0) unlink(pick_flag_path(session_root).c_str());
   const DisplayFileHeader head = {kDisplayFileMagic, width, height, mem_.big_endian() ? 1u : 0u,
                                   (u32)getpid(), 0, 0, (u32)session_root};
   memcpy(map, &head, sizeof head);
