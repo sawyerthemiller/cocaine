@@ -163,7 +163,7 @@ int main(int argc, char** argv) {
       opt.session = value();
     } else if (a == "--view") {
       // Used by the process running the guest's window server: show its display.
-      return run_viewer(value());
+      return run_viewer(value(), opt.session, argv[0], opt.sysroot);
     } else if (a == "--session-server") {
       // Used by a session's first process to start the stand-in for launchd.
       session_root = atoi(value());

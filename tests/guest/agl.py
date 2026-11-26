@@ -6,6 +6,8 @@ glu = ctypes.CDLL("/System/Library/Frameworks/OpenGL.framework/Versions/A/Librar
 uint = ctypes.c_uint
 intp = ctypes.POINTER(ctypes.c_int)
 
+agl.aglGetVersion.argtypes = [intp, intp]
+agl.aglGetVersion.restype = None
 agl.aglQueryRendererInfoCFM.argtypes = [ctypes.c_void_p, ctypes.c_int]
 agl.aglQueryRendererInfoCFM.restype = uint
 agl.aglNextRendererInfo.argtypes = [uint]
@@ -21,10 +23,21 @@ agl.aglCreateContextCFM.restype = uint
 agl.aglDestroyPixelFormat.argtypes = [uint]
 agl.aglDisable.argtypes = [uint, uint]
 agl.aglSetCurrentContext.argtypes = [uint]
+agl.aglGetDrawable.argtypes = [uint]
+agl.aglGetDrawable.restype = uint
+agl.aglSetDrawable.argtypes = [uint, uint]
 agl.aglDestroyContext.argtypes = [uint]
 gl.glMatrixMode.argtypes = [uint]
 gl.glGetDoublev.argtypes = [uint, ctypes.POINTER(ctypes.c_double)]
 glu.gluOrtho2D.argtypes = [ctypes.c_double] * 4
+
+major, minor = ctypes.c_int(-1), ctypes.c_int(-1)
+agl.aglGetVersion(ctypes.byref(major), ctypes.byref(minor))
+assert (major.value, minor.value) == (2, 0)
+major.value, minor.value = -1, -1
+agl.aglGetVersion(ctypes.byref(major), None)
+agl.aglGetVersion(None, ctypes.byref(minor))
+assert (major.value, minor.value) == (2, 0)
 
 assert not agl.aglQueryRendererInfoCFM(1, 1)
 assert agl.aglGetError() == 10006
@@ -50,12 +63,17 @@ fmt = agl.aglChoosePixelFormatCFM(None, 0, attrs)
 assert fmt
 assert agl.aglDescribePixelFormat(fmt, 70, ctypes.byref(value))
 assert value.value != 0
+assert agl.aglDescribePixelFormat(fmt, 7, ctypes.byref(value))
+assert value.value == 1
 ctx = agl.aglCreateContextCFM(fmt, 0)
 assert ctx
 agl.aglDestroyPixelFormat(fmt)
 assert not agl.aglDescribePixelFormat(fmt, 70, ctypes.byref(value))
 assert agl.aglGetError() == 10002
 assert agl.aglSetCurrentContext(ctx)
+assert agl.aglSetDrawable(ctx, 0)
+assert agl.aglGetDrawable(ctx) == 0 and agl.aglGetError() == 0
+assert agl.aglGetDrawable(0) == 0 and agl.aglGetError() == 10004
 assert agl.aglDisable(ctx, 202)
 assert not agl.aglDisable(ctx, 0xffffffff)
 assert agl.aglGetError() == 10010

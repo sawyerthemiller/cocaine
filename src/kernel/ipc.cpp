@@ -3,6 +3,7 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <servers/bootstrap.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -13,6 +14,7 @@
 #include "kernel/mach_message.h"
 #include "kernel/process.h"
 #include "kernel/tunnel.h"
+#include "session/pacing.h"
 
 extern char** environ;
 
@@ -477,6 +479,10 @@ void Process::ensure_session_server() {
     return;
   }
 
+  std::string pacing_error;
+  uint32_t* pacing = create_session_pacing(name, initial_low_latency_pacing(), pacing_error);
+  if (!pacing) log_warn("low latency menu unavailable: %s", pacing_error.c_str());
+
   const std::string root = std::to_string(getpid());
   std::vector<std::string> cmd = {opt_.self_path, "--session-server", root, "--session", name};
   if (!opt_.sysroot.empty()) {
@@ -546,8 +552,15 @@ void Process::ensure_session_server() {
     log_warn("could not start the session server (%s); system services will not answer",
              mach_error_string(kr));
     mach_port_mod_refs(mach_task_self(), named, MACH_PORT_RIGHT_RECEIVE, -1);
+    if (pacing) {
+      munmap(pacing, sizeof *pacing);
+      const std::string path = session_pacing_path(name);
+      unlink(path.c_str());
+      rmdir(path.substr(0, path.rfind('/')).c_str());
+    }
     return;
   }
+  pacing_control_.store(pacing, std::memory_order_release);
   session_name_ = name;
   if (g_verbosity > 0) {
     char tmp[PATH_MAX] = "/tmp/";

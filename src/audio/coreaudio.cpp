@@ -47,6 +47,8 @@ constexpr u32 fourcc(const char (&s)[5]) {
 constexpr u32 kSystem = 1, kDevice = 0x100, kStream = 0x200;
 constexpr double kRate = 44100.0;
 constexpr u32 kChannels = 2;
+constexpr u32 kRingFrames = 16384;
+static_assert((kRingFrames & (kRingFrames - 1)) == 0);
 
 // Errors, as Core Audio spells them.
 constexpr u32 kNoErr = 0;
@@ -78,6 +80,7 @@ struct Format {
 struct Unit {
   u32 handle = 0;
   u32 render = 0, refcon = 0;
+  u32 source = 0, source_bus = 0, render_api = 0;
   bool started = false;
   Format format;
   double phase = 0;  // for resampling: how far past the last input frame the next output frame is
@@ -96,7 +99,7 @@ struct Device {
   bool worker = false, running = false, stopping = false;
 
   // The ring between the guest's IO procedures and the native output.
-  std::vector<float> ring = std::vector<float>(16384 * kChannels);
+  std::vector<float> ring = std::vector<float>((size_t)kRingFrames * kChannels);
   size_t head = 0, tail = 0;  // in frames, ever-increasing
   std::atomic<u64> played{0};
   u64 start_host = 0;
@@ -122,10 +125,9 @@ OSStatus render(void*, AudioUnitRenderActionFlags*, const AudioTimeStamp*, UInt3
   float* dst = (float*)out->mBuffers[0].mData;
   {
     std::lock_guard<std::mutex> lk(g_dev.mu);
-    const size_t cap = g_dev.ring.size() / kChannels;
     for (UInt32 f = 0; f < frames; f++) {
       if (g_dev.tail < g_dev.head) {
-        const size_t at = (g_dev.tail % cap) * kChannels;
+        const size_t at = (g_dev.tail & (kRingFrames - 1)) * kChannels;
         dst[2 * f] = g_dev.ring[at] * g_dev.volume;
         dst[2 * f + 1] = g_dev.ring[at + 1] * g_dev.volume;
         g_dev.tail++;
@@ -531,7 +533,18 @@ void pull_unit(GuestCall& c, Unit& u, u32 frames, u32 ts, u32 list, u32 data, u3
   }
   memset(m.host(data), 0, (size_t)per_buffer * nbuf);
   m.w32(flags, 0);
-  c.call(u.render, {u.refcon, flags, ts, 0, need, list});
+  if (u.render) {
+    c.call(u.render, {u.refcon, flags, ts, 0, need, list});
+  } else {
+    const u32 status = c.call(u.render_api, {u.source, flags, ts, u.source_bus, need, list});
+    if (status) {
+      static std::mutex error_mu;
+      static std::set<u32> errors;
+      std::lock_guard<std::mutex> lk(error_mu);
+      if (errors.insert(status).second) log_warn("Core Audio: connected unit render failed (%d)", (s32)status);
+      return;
+    }
+  }
   // Input frame k, channel ch, as a float. Past the frames asked for (a
   // rate far enough above the device's that `need` was held down), the
   // last one again.
@@ -571,9 +584,11 @@ void worker_main(GuestCall& c) {
     out_ts = c.scratch(64), flags = c.scratch(16), data = c.scratch(kDataBytes);
   }
   std::vector<float> mix;
+  std::vector<Proc> procs;
+  std::vector<Unit> units;
   for (;;) {
-    std::vector<Proc> procs;
-    std::vector<Unit> units;
+    procs.clear();
+    units.clear();
     u32 frames;
     size_t queued = 0;
     {
@@ -594,7 +609,7 @@ void worker_main(GuestCall& c) {
         if (p.started) procs.push_back(p);
       }
       for (const Unit& u : g_dev.units) {
-        if (u.started && u.render) units.push_back(u);
+        if (u.started && (u.render || u.source)) units.push_back(u);
       }
       frames = g_dev.frames;
     }
@@ -628,6 +643,8 @@ void worker_main(GuestCall& c) {
       }
     }
     for (Unit& u : units) {
+      if (u.source) write_time(m, out_ts, (double)g_dev.rendered * u.format.rate / kRate, host);
+      else write_time(m, out_ts, (double)g_dev.rendered, host);
       pull_unit(c, u, frames, out_ts, out_list, data, flags, mix);
       std::lock_guard<std::mutex> lk(g_dev.mu);
       for (Unit& kept : g_dev.units) {
@@ -640,9 +657,8 @@ void worker_main(GuestCall& c) {
     }
     {
       std::lock_guard<std::mutex> lk(g_dev.mu);
-      const size_t cap = g_dev.ring.size() / kChannels;
       for (u32 f = 0; f < frames; f++) {
-        const size_t at = (g_dev.head % cap) * kChannels;
+        const size_t at = (g_dev.head & (kRingFrames - 1)) * kChannels;
         g_dev.ring[at] = mix[2 * f];
         g_dev.ring[at + 1] = mix[2 * f + 1];
         g_dev.head++;
@@ -1073,12 +1089,46 @@ void AudioUnitSetProperty_(GuestCall& c) {
   Unit* u = unit_of(inst);
   if (!u) lk.unlock();
   NOT_OURS(inst, id, scope, element, data, size);
-  if (id == 8 && scope == 1 && data && size >= 40) {  // the format the guest will give
+  if (id == 1) {  // kAudioUnitProperty_MakeConnection
+    if (scope != 1 || element != 0 || size < 12 ||
+        !data || !c.mem.range_ok(data, 12, GuestMemory::kRead) || c.mem.r32(data + 8) != element)
+      return c.ret((u32)kAudioUnitErr_InvalidPropertyValue);
+    const u32 source = c.mem.r32(data), bus = c.mem.r32(data + 4);
+    if (!source) {
+      u->source = u->source_bus = u->render_api = 0;
+      return c.ret(0);
+    }
+    lk.unlock();
+    const u32 get = c.symbol("AudioUnitGetProperty"), render = c.symbol("AudioUnitRender");
+    const u32 format = c.scratch(44);
+    if (!get || !render || !format) {
+      log_warn("Core Audio: cannot connect a guest audio unit");
+      return c.ret((u32)kAudioUnitErr_FailedInitialization);
+    }
+    c.mem.w32(format + 40, 40);
+    const u32 status = c.call(get, {source, 8, 2, bus, format, format + 40});
+    if (status) return c.ret(status);
+    if (c.mem.r32(format + 40) < 40 || c.mem.r32(format + 8) != fourcc("lpcm"))
+      return c.ret((u32)kAudioUnitErr_FormatNotSupported);
+    Format source_format;
+    read_format(c, format, source_format);
+    lk.lock();
+    u = unit_of(inst);
+    if (!u) return c.ret((u32)kBadInstance);
+    u->source = source;
+    u->source_bus = bus;
+    u->render_api = render;
+    u->render = u->refcon = 0;
+    u->format = source_format;
+    u->phase = 0;
+    u->last[0] = u->last[1] = 0;
+  } else if (id == 8 && scope == 1 && data && size >= 40) {  // the format the guest will give
     if (c.mem.r32(data + 8) != fourcc("lpcm")) return c.ret((u32)-10868);  // kAudioUnitErr_FormatNotSupported
     read_format(c, data, u->format);
   } else if (id == 23 && data && size >= 8) {  // render callback
     u->render = c.mem.r32(data);
     u->refcon = c.mem.r32(data + 4);
+    u->source = u->source_bus = u->render_api = 0;
   } else if (id == 2 && scope == 1 && data) {  // sample rate
     const u64 bits = c.mem.r64(data);
     memcpy(&u->format.rate, &bits, 8);

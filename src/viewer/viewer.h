@@ -26,4 +26,5 @@ struct DisplayFileHeader {
 
 // Shows the display in that file in a window, until the window is closed or
 // the writer goes away.
-int run_viewer(const char* path);
+int run_viewer(const char* path, const std::string& session,
+               const std::string& self, const std::string& sysroot);

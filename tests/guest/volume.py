@@ -21,6 +21,30 @@ def statfs(path):
     assert lib.statfs(path, result) == 0
     return result.raw
 
+def root_names(path):
+    attrs = AttrList(5, 0, 1, 0x80002000, 0, 0, 0)
+    result = ctypes.create_string_buffer(1024)
+    assert lib.getattrlist(path, ctypes.byref(attrs), result, len(result), 0) == 0
+    names = []
+    for at in (4, 12):
+        offset, length = struct.unpack("=iI", result.raw[at:at + 8])
+        names.append(result.raw[at + offset:at + offset + length].rstrip("\0"))
+    return names
+
+def object_name(path):
+    attrs = AttrList(5, 0, 1, 0, 0, 0, 0)
+    result = ctypes.create_string_buffer(1024)
+    assert lib.getattrlist(path, ctypes.byref(attrs), result, len(result), 0) == 0
+    offset, length = struct.unpack("=iI", result.raw[4:12])
+    return result.raw[4 + offset:4 + offset + length].rstrip("\0")
+
+device = os.stat("/System").st_dev
+for path in ("/", "/.", "//", "/System/..", "/.vol/%d/@" % device, "/.vol/%d/2" % device):
+    assert root_names(path) == ["Macintosh HD", "Macintosh HD"], (path, root_names(path))
+    assert object_name(path) == "Macintosh HD", (path, object_name(path))
+assert root_names("/System") == ["Macintosh HD", "Macintosh HD"]
+assert object_name("/System") == "System"
+
 root = statfs("/")
 system = statfs("/System")
 count = lib.getfsstat(None, 0, 2)
@@ -113,6 +137,8 @@ if volume:
     vol_device = os.stat(volume).st_dev
     assert os.stat("/.vol/%d/@" % vol_device).st_ino == os.stat(volume).st_ino
     assert os.stat("/.vol/%d/2" % vol_device).st_ino == os.stat(volume).st_ino
+    assert root_names("/.vol/%d/@" % vol_device) == root_names(volume)
+    assert object_name("/.vol/%d/@" % vol_device) == object_name(volume)
     marker = os.environ.get("COCAINE_TEST_VOLUME_MARKER")
     if marker:
         assert os.path.isfile(os.path.join(volume, marker))
@@ -145,7 +171,6 @@ if volume:
     io.IOObjectRelease(parents.value)
     io.IOObjectRelease(media)
 
-device = os.stat("/System").st_dev
 assert mount_flags("/.vol/%d/@" % device) == mount_flags("/System")
 assert os.stat("/.vol/%d/@/System" % device).st_ino == os.stat("/System").st_ino
 if device != 0:

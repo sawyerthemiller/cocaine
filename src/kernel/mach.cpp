@@ -31,6 +31,7 @@
 #include "kernel/process.h"
 #include "kernel/display_pixels.h"
 #include "kernel/tunnel.h"
+#include "session/pacing.h"
 #include "viewer/viewer.h"
 
 #include <fcntl.h>
@@ -296,6 +297,12 @@ void Process::serve_other_processes(u32 port_set) {
       memcpy(mem_.host(scratch), in.bytes.data(), size);
       answered = kernel_rpc(main_, in.port, kport, scratch, size, reply);
     }
+    if (id == 3807) {
+      // The decoded out-of-line data belongs to this kernel request, not
+      // to guest code. The reply right is still needed below.
+      put(in.bytes, 8, 0);
+      ipc_discard(in);
+    }
     if (!reply_port) continue;
     if (!answered) {
       Message m(be, reply_port, id + 100);
@@ -310,6 +317,11 @@ void Process::serve_other_processes(u32 port_set) {
     put(reply, 8, reply_port);
     put(reply, 12, 0);
     ipc_send(reply.data(), (u32)reply.size(), 0, 0);
+    if (id == 3805 && reply.size() >= 40 && (get(reply, 0) & kComplex) &&
+        get(reply, 24) == 1 && reply[39] == 1) {
+      const u32 at = get(reply, 28), bytes = get(reply, 32);
+      if (at && bytes) mem_.unmap(at, bytes);
+    }
   }
 }
 
@@ -354,7 +366,14 @@ void Process::setup_ports(Thread& t) {
     bootstrap_port_ = join_session(name, task_port_);
     if (bootstrap_port_) {
       session_name_ = name;
+      if (!pacing_control_.load(std::memory_order_acquire)) {
+        std::string error;
+        uint32_t* pacing = open_session_pacing(name, false, error);
+        if (!pacing) log_warn("low latency session control unavailable: %s", error.c_str());
+        pacing_control_.store(pacing, std::memory_order_release);
+      }
     } else {
+      pacing_control_.store(nullptr, std::memory_order_release);
       log_info("the session %s is gone; starting a new one", name.c_str());
     }
   }
@@ -441,25 +460,7 @@ bool Process::publish_changed() {
   const u8* const from = mem_.host(display_at_);
   bool started = false;
   constexpr u32 kBand = 32;
-  std::vector<u8> converted;
-  if (display_bits_ == 16 || source_row != row) converted.resize(row * kBand);
-  for (u32 y = 0; y < display_h_; y += kBand) {
-    const size_t at = row * y, n = row * std::min(kBand, display_h_ - y);
-    const u8* source = from + source_row * y;
-    if (!converted.empty()) {
-      const u32 lines = std::min(kBand, display_h_ - y);
-      for (u32 line = 0; line < lines; line++) {
-        u8* dst = converted.data() + row * line;
-        const u8* src = source + source_row * line;
-        if (display_bits_ == 32) {
-          memcpy(dst, src, row);
-        } else {
-          rgb555_to_display(src, dst, display_w_, mem_.big_endian());
-        }
-      }
-      source = converted.data();
-    }
-    if (memcmp(to + at, source, n) == 0) continue;
+  const auto begin_update = [&] {
     if (!started) {
       __atomic_add_fetch(&head->frame, 1, __ATOMIC_ACQ_REL);  // odd: being written
       // The viewer must see the odd number before any of the pixels that
@@ -467,7 +468,34 @@ bool Process::publish_changed() {
       __atomic_thread_fence(__ATOMIC_SEQ_CST);
       started = true;
     }
-    memcpy(to + at, source, n);
+  };
+  if (display_bits_ == 32 && source_row != row) {
+    for (u32 y = 0; y < display_h_; y++) {
+      const size_t at = row * y;
+      const u8* source = from + source_row * y;
+      if (memcmp(to + at, source, row) == 0) continue;
+      begin_update();
+      memcpy(to + at, source, row);
+    }
+  } else {
+    const bool convert = display_bits_ == 16;
+    if (convert) display_conversion_.resize(row * kBand);
+    for (u32 y = 0; y < display_h_; y += kBand) {
+      const size_t at = row * y, n = row * std::min(kBand, display_h_ - y);
+      const u8* source = from + source_row * y;
+      if (convert) {
+        const u32 lines = std::min(kBand, display_h_ - y);
+        for (u32 line = 0; line < lines; line++) {
+          u8* dst = display_conversion_.data() + row * line;
+          const u8* src = source + source_row * line;
+          rgb555_to_display(src, dst, display_w_, mem_.big_endian());
+        }
+        source = display_conversion_.data();
+      }
+      if (memcmp(to + at, source, n) == 0) continue;
+      begin_update();
+      memcpy(to + at, source, n);
+    }
   }
   if (started) __atomic_add_fetch(&head->frame, 1, __ATOMIC_RELEASE);  // even: a whole picture
   return started;
@@ -573,7 +601,10 @@ void Process::share_display(u32 addr, u64 shared_bytes) {
   // The viewer is this same program, started to show the file.
   if (!opt_.self_path.empty() && !getenv("COCAINE_NO_VIEWER")) {
     std::string self = opt_.self_path, flag = "--view", file = path;
-    char* argv[] = {self.data(), flag.data(), file.data(), nullptr};
+    std::string sessionFlag = "--session", session = session_name_;
+    std::string rootFlag = "--sysroot", root = opt_.sysroot;
+    char* argv[] = {self.data(), sessionFlag.data(), session.data(), rootFlag.data(), root.data(),
+                    flag.data(), file.data(), nullptr};
     // What the viewer writes (the mouse) comes back down a pipe and is
     // posted to the guest's input system.
     int ends[2] = {-1, -1};
@@ -1103,7 +1134,12 @@ bool Process::kernel_rpc(Thread& t, u32 name, const KPort& port, u32 msg, u32 si
       switch (id) {
         case 200: {  // host_info(flavor) -> words
           const u32 flavor = arg(0), want = arg(1);
-          Message m(be, local, id + 100);
+          const u32 n = want < 12 ? want : 12;
+          const size_t capacity = flavor == 1 ? 40 + 4 * (size_t)n
+                                   : flavor == 3 ? 48
+                                   : flavor == 5 ? 72
+                                                 : 40;
+          Message m(be, local, id + 100, false, capacity);
           m.ndr();
           if (flavor == 1) {  // HOST_BASIC_INFO
             const u32 two_gb = 0x80000000u;
@@ -1115,10 +1151,9 @@ bool Process::kernel_rpc(Thread& t, u32 name, const KPort& port, u32 msg, u32 si
                 be ? 0u : two_gb,                // max_mem, a 64-bit count of bytes
                 be ? two_gb : 0u,
             };
-            const u32 n = want < 12 ? want : 12;
             m.put(kSuccess);
             m.put(n);
-            for (u32 i = 0; i < n; i++) m.put(info[i]);
+            m.put_words(info, n);
           } else if (flavor == 3) {  // HOST_SCHED_INFO: minimum timeout and quantum, in ms
             m.put(kSuccess);
             m.put(2);
@@ -1382,6 +1417,17 @@ bool Process::kernel_rpc(Thread& t, u32 name, const KPort& port, u32 msg, u32 si
           const u32 from = arg(0), bytes = arg(1), to = arg(2);
           if (!mem_.range_ok(from, bytes) || !mem_.range_ok(to, bytes)) return simple(kInvalidAddress);
           memmove(mem_.host(to), mem_.host(from), bytes);
+          return simple(kSuccess);
+        }
+        case 3807: {  // vm_write(destination, out-of-line data)
+          if (size < 56 || !(mem_.r32(msg) & kComplex) || mem_.r32(msg + 24) != 1 ||
+              mem_.r8(msg + 39) != 1) return simple(kInvalidArgument);
+          const u32 from = mem_.r32(msg + 28), bytes = mem_.r32(msg + 32);
+          const u32 to = mem_.r32(msg + 48), count = mem_.r32(msg + 52);
+          if (bytes != count) return simple(kInvalidArgument);
+          if (bytes && (!mem_.range_ok(from, bytes, GuestMemory::kRead) ||
+                        !mem_.range_ok(to, bytes, GuestMemory::kWrite))) return simple(kInvalidAddress);
+          if (bytes) memmove(mem_.host(to), mem_.host(from), bytes);
           return simple(kSuccess);
         }
         case 3805: {  // vm_read(address, size) -> a fresh copy of that memory
@@ -1666,24 +1712,29 @@ bool Process::kernel_rpc(Thread& t, u32 name, const KPort& port, u32 msg, u32 si
         // what asks (the Objective-C runtime, wanting to know where each
         // thread is before it frees something).
         const Thread& th = *port.thread;
-        std::vector<u32> state;
+        u32 state[40];
+        u32 state_count = 0;
         if (arch_ == Arch::PPC) {
-          state = {th.ppc.pc, 0x0200D032};
-          for (u32 v : th.ppc.gpr) state.push_back(v);
-          for (u32 v : {th.ppc.cr, th.ppc.xer, th.ppc.lr, th.ppc.ctr, 0u, th.ppc.vrsave}) state.push_back(v);
+          state[state_count++] = th.ppc.pc;
+          state[state_count++] = 0x0200D032;
+          for (u32 v : th.ppc.gpr) state[state_count++] = v;
+          for (u32 v : {th.ppc.cr, th.ppc.xer, th.ppc.lr, th.ppc.ctr, 0u, th.ppc.vrsave})
+            state[state_count++] = v;
         } else {
           const u32* R = th.x86.reg;
-          state = {R[X86State::EAX], R[X86State::EBX], R[X86State::ECX], R[X86State::EDX],
-                   R[X86State::EDI], R[X86State::ESI], R[X86State::EBP], R[X86State::ESP],
-                   0x1F, th.x86.eflags, th.x86.eip, 0x17, 0x1F, 0x1F, 0, th.x86.seg[X86State::GS]};
+          for (u32 v : {R[X86State::EAX], R[X86State::EBX], R[X86State::ECX], R[X86State::EDX],
+                        R[X86State::EDI], R[X86State::ESI], R[X86State::EBP], R[X86State::ESP],
+                        0x1Fu, th.x86.eflags, th.x86.eip, 0x17u, 0x1Fu, 0x1Fu, 0u,
+                        (u32)th.x86.seg[X86State::GS]})
+            state[state_count++] = v;
         }
         if (arg(0) != 1) return simple(kInvalidArgument);
-        const u32 n = arg(1) < state.size() ? arg(1) : (u32)state.size();
-        Message m(be, local, id + 100);
+        const u32 n = arg(1) < state_count ? arg(1) : state_count;
+        Message m(be, local, id + 100, false, 40 + 4 * n);
         m.ndr();
         m.put(kSuccess);
         m.put(n);
-        for (u32 i = 0; i < n; i++) m.put(state[i]);
+        m.put_words(state, n);
         reply = m.finish();
         return true;
       }

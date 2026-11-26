@@ -23,11 +23,11 @@ namespace {
 struct Hook {
   std::string name;
   void (*fn)(GuestCall&);
+  u32 original = 0;
 };
 std::mutex g_hooks_mu;
 std::vector<Hook> g_hooks;
 std::unordered_map<std::string, u32> g_hook_index;
-std::unordered_map<u32, u32> g_originals;  // hook index -> the guest's own function, moved
 
 // How long the Intel instruction at `p` is, for the few that start functions;
 // 0 for any other.
@@ -337,6 +337,22 @@ void Process::note_code_mapping(u32 at, u32 len, int fd, u64 offset) {
         fclose(out);
       }
     }
+  } else if (powerpc && ends_with(img.path, "/DrawSprocket.framework/Versions/A/DrawSprocket") &&
+             read_image(img)) {
+    // Leopard's depth search advances by two, missing 32-bit modes when
+    // only 16/32-bit entries remain. Check the whole loop before fixing
+    // its stride; the virtual driver's first three slots must stay 1x1.
+    const u32 start = img.slide + 0x1E18;
+    const u32 loop[] = {0x7F83D800, 0x409C0014, 0x3BDE0002,
+                        0x7F9EE800, 0x419CFFDC, 0x3BC0FFFF};
+    if (start >= at && (u64)start + sizeof loop <= (u64)at + len) {
+      bool matches = true;
+      for (u32 k = 0; k < sizeof loop / sizeof loop[0]; k++) {
+        if (mem_.r32(start + 4 * k) != loop[k]) matches = false;
+      }
+      if (matches) mem_.w32(start + 8, 0x3BDE0001);  // addi r30, r30, 1
+      else log_warn("this DrawSprocket is not the one cocaine knows: its depth search is unchanged");
+    }
   }
 
   // Is it one whose functions cocaine supplies?
@@ -373,7 +389,7 @@ void Process::note_code_mapping(u32 at, u32 len, int fd, u64 offset) {
         const u32 kept = keep_original(where);
         if (!kept) log_warn("can't keep the guest's own %s; calls cocaine doesn't handle will fail", name.c_str());
         std::lock_guard<std::mutex> lk(g_hooks_mu);
-        g_originals[index] = kept;
+        g_hooks[index].original = kept;
       }
       plant_host_call(where, kHookCallBase + index);
       taken++;
@@ -434,23 +450,26 @@ u32 Process::keep_original(u32 fn) {
 }
 
 void Process::run_hook(Thread& t, u32 index) {
-  Hook h;
+  void (*fn)(GuestCall&) = nullptr;
+  std::string name;
   u32 original = 0;
   {
     std::lock_guard<std::mutex> lk(g_hooks_mu);
     if (index >= g_hooks.size()) return;
-    h = g_hooks[index];
-    if (auto it = g_originals.find(index); it != g_originals.end()) original = it->second;
+    const Hook& h = g_hooks[index];
+    fn = h.fn;
+    original = h.original;
+    if (!fn) name = h.name;
   }
   GuestCall c(*this, t);
   c.original_ = original;
-  if (h.fn) {
-    h.fn(c);
+  if (fn) {
+    fn(c);
   } else {
     static std::mutex said_mu;
     static std::unordered_set<std::string> said;
     std::lock_guard<std::mutex> lk(said_mu);
-    if (said.insert(h.name).second) log_warn("%s is not passed through to the Mac yet", h.name.c_str());
+    if (said.insert(name).second) log_warn("%s is not passed through to the Mac yet", name.c_str());
     not_done_yet(c);
   }
   // The function's first instruction was the host call: return from it.

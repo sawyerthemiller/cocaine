@@ -25,8 +25,10 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   only what cares where an element sits is renumbered (`vperm` is a `TBL`
   over {b, a} with index `~c & 31`, `lvx` a load and a 16-byte reverse).
   Vector float ops check the FPSCR rounds to nearest, since AltiVec always
-  does, and leave the rare other case to the interpreter. Anything else
-  rare (the remaining AltiVec, the odder floating point, traps) is done by
+  does, and leave the rare other case to the interpreter. The common FPSCR
+  save and restore instructions are translated too; a restore that changes
+  rounding goes through the interpreter to update the host's rounding mode.
+  Anything else rare (the remaining AltiVec, the odder floating point, traps) is done by
   calling the interpreter for that one instruction, which is what keeps
   the translator small and lets it be checked: the same tests run both ways and must agree bit for bit. When
   guest memory holding code is unmapped, mapped over, or flushed by the
@@ -76,13 +78,17 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   redirected into that system root; everything else is this Mac's own files.
   PowerPC PEF executables are passed to Leopard's `LaunchCFMApp`. Imported
   AppleDouble sidecars supply missing Finder metadata and read-only resource
-  forks without changing the imported files. Parent IDs for immediate system
-  root children use the guest volume root ID so Carbon can build paths.
+  forks without changing the imported files. The imported root and its parent
+  use guest volume root ID 2, as do the parent IDs of its immediate children,
+  so Carbon and Launch Services can resolve paths without walking into the
+  imported folder's host parent.
   `setattrlist` translates 32-bit timestamps and byte order when Carbon sets
   folder dates and Finder metadata together.
   Volume enumeration uses the imported root's backing volume, including its
   actual read-only status, and adds browsable host mounts under `/Volumes`.
   Carbon's `/.vol/<device>/@` and root folder ID 2 resolve those mounts.
+  The guest root's object and volume names are `Macintosh HD`, not the
+  imported folder's name; other mounted volumes keep their own names.
   IOKit identifies mounted disk images and optical media by BSD device name
   and presents a minimal CD media ancestor with the `Whole` property, for
   installers that check for a disc. This does not emulate disc commands.
@@ -90,7 +96,21 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   libraries:
   - BSD system calls. The host is Darwin too, so most map onto the same host
     call after translating the calling convention, structure layouts and (for
-    PowerPC) byte order. `F_PREALLOCATE` translates the guest's 32-bit
+    PowerPC) byte order. `exit` ends the host process from whichever guest
+    thread called it, after reporting statistics and flushing host output.
+    Sockets pass through to the host, including `FIONBIO` and
+    `SIOCGIFFLAGS` with guest byte order translated. For PowerPC, ordinary
+    reads and writes on routing sockets translate the route header and
+    native-order sockaddr fields; descriptor inspection also handles
+    duplicated and inherited sockets. Since guest configd runs without network
+    plug-ins, a read-only open of a missing guest `/var/run/resolv.conf` gets
+    an unlinked, read-only snapshot of the host's file. Existing guest
+    configuration wins; other operations never redirect to the host file.
+    The named CPU, bus and time-base frequency sysctls return 64-bit values,
+    while their legacy numeric MIBs return 32-bit values, as on Leopard.
+    Waiting for the main thread to notice an exit flag left GameRanger's Quit
+    hung when its main thread was blocked in a Mach receive.
+    `F_PREALLOCATE` translates the guest's 32-bit
     `fstore_t` to the host structure and returns the bytes allocated.
     EV Nova's registration tool needs it to initialize its preference file.
     Where today's kernel answers differently, cocaine
@@ -130,7 +150,7 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   to learn which daemon provides which service, hands out service ports, and
   starts Apple's real daemon behind a port, as a guest, when the first
   message arrives for it. Only daemons known to work are on call (`notifyd`,
-  `DirectoryService`, `dirhelper`, `securityd`, `coreservicesd`, `configd`
+  `DirectoryService`, `dirhelper`, `securityd`, `coreservicesd`, `pboard`, `configd`
   (without its plug-ins, `-b`, and in the foreground, `-d`), and
   `WindowServer`, `ATSServer`, `loginwindow` and `hidd`, the last four for Intel
   programs only where the keys to them have been supplied). Each starts in
@@ -140,8 +160,21 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   root, and their messages are stamped as root's, because both they and
   their clients check. A daemon can collect its ports either of the two ways
   `launchd` offers: by name over Mach, or by asking on the socket every job
-  is started with. With `-v` cocaine says where the session's log is; it
-  holds what the server did, what the daemons printed, and everything any
+  is started with. Pasteboard lookups wait until `pboard` checks in, because
+  its clients need the shared memory it creates during startup. The guest
+  viewer bridges plain text, RTF, HTML, TIFF/PNG/JPEG images and file URLs between the guest pasteboard and the macOS general
+  pasteboard (`src/viewer/clipboard.mm` and `clipboard_guest.py`); the
+  Leopard Python 2.5 helper reads and writes public and legacy flavors.
+  It polls for guest changes, and imports host changes before forwarding
+  viewer input. Shared files are referenced directly after matching their
+  full device and inode numbers in both views; inaccessible host files are
+  copied into a private temporary directory. Staged folders reject absolute
+  and parent-relative symbolic links, which could escape that directory.
+  Temporary copies are normally removed when the viewer ends unless a guest exports
+  one back to macOS; those are retained so the host clipboard remains usable,
+  and their location is logged. The bridge starts only with a viewer.
+  With `-v` cocaine says where
+  the session's log is; it holds what the server did, what the daemons printed, and everything any
   guest sent to `syslog`, which is often the only place a daemon explains
   itself.
 - **The desktop and the menu bar.** The Dock, which draws Leopard's desktop
@@ -178,6 +211,13 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   640x480 RGB555 and 32-bit modes, reusing two unsupported indexed-color
   slots while keeping the existing true-color modes. The first three
   entries must stay 1x1 placeholders: the driver treats them specially.
+  The checked PowerPC DrawSprocket has a depth-search loop that advances
+  by two entries. With just 16/32-bit modes at a resolution, it skips the
+  requested 32-bit mode and returns 16-bit; Marble Blast then fails to
+  reserve the display and crashes after discarding its textures. A checked
+  in-memory instruction patch makes that loop visit every entry, leaving
+  Apple's files on disk untouched. Marble Blast can switch to DrawSprocket
+  fullscreen and back without changing the host display.
   Without real 640x480 modes, DrawSprocket chooses 800x600 for a 640x480
   request and apps such as Ghost Recon draw their menus into a corner.
   These checked in-memory patches are not game-specific and leave viewport
@@ -230,8 +270,11 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   the window server finds them as it would on real hardware. Its wake-up
   notification is nonblocking: a full notification port already holds a
   wake-up, so it must not stall later input. The window server decides
-  which app gets what. The viewer sends the Mac's own measure of each
-  movement with it, scaled to the current guest display and viewer size.
+  which app gets what. Keyboard presses, releases, repeats and modifier
+  changes retain the guest's cursor position: host key events can report
+  `(0, 0)` and must not move a captured game's camera. The viewer sends the
+  Mac's own measure of each movement with it, scaled to the current guest
+  display and viewer size.
   When a game captures the pointer for camera controls, its movement instead
   stays in host points, so resizing the viewer does not change camera
   sensitivity. When the window server moves the pointer itself
@@ -254,7 +297,9 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   lands in native code that reads the arguments the PowerPC way (integers
   in r3-r10, floats in f1-f13, the rest on the stack) and makes the call on
   the Mac's own library (`src/gl/gl.cpp`, `src/al/al.cpp`). Functions of
-  those libraries that aren't done yet say so once and return 0. Byte
+  those libraries that aren't done yet say so once and return 0. Hook
+  dispatch copies names only for those warnings; implemented calls take the
+  handler and any saved original together under the hook lock. Byte
   order is the work: values in registers need nothing, but matrices,
   vertex and index arrays, glGet answers and 16-bit sound samples are
   big-endian in guest memory and get swapped on the way through. Intel
@@ -272,12 +317,57 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   points at them and converted at each draw. Packed PowerPC arrays are
   byte-swapped in vector-sized blocks; strided arrays are copied and
   swapped component by component, while Intel arrays need no swap.
+  ARB assembly program uploads, environment parameters and generic vertex
+  arrays pass through for Halo Demo; enabled attributes retain their own
+  pointers and normalization and are converted at each draw. The attribute
+  limit is discovered when a context first becomes current, even if a
+  drawable has already created its framebuffer. In fixed-function draws the
+  host uses conventional arrays, with generic attribute zero supplying
+  position only when no conventional position array is enabled. With a
+  vertex program enabled, an invalid stale generic array is ignored if
+  the program doesn't reference it, without requiring a conventional
+  replacement. Invalid arrays referenced by the program still reject the
+  draw and log their pointer, vertex range and vertex-program state.
+  Rectangle textures, framebuffer-to-texture copies, blend equations and
+  four-component texture coordinates pass through. With
+  `COCAINE_GL_LEGACY_TEXTURE_FILTER=1`, newly bound 2D texture names start
+  with linear minification rather than OpenGL's mipmapped default. Explicit
+  minification and magnification filters, rebinding existing textures and
+  other texture targets are unchanged. DXT 2D textures additionally clamp
+  their maximum mip level to the contiguous, correctly sized and formatted
+  chain supplied by the guest. Uploads and base/maximum-level changes
+  recompute this range, retaining the guest's requested maximum as an upper
+  bound so later uploads can extend the chain. Range bookkeeping is shared
+  by sharing contexts and discarded when texture names are deleted.
+  Uncompressed replacements restore the requested maximum. This fixes
+  Halo's dark smoke blocks without dropping its mipmapped particle filters.
+  The launcher enables this for PowerPC and 32-bit Intel programs named
+  `Halo` or `Halo Demo`, including app bundles and universal binaries,
+  unless the environment already sets the flag. The tested PowerPC PEF
+  Demo's generated radar texture has no mipmaps and never sets its
+  minification filter, producing a white square with the standard default.
+  3D texture uploads honor
+  the guest's unpack state and byte order. The host's ARB vertex and fragment
+  program extensions are advertised for Halo, although some of their entry
+  points are not yet implemented.
   Each guest OpenGL context
-  draws into an offscreen framebuffer on the Mac's GPU. AGL renderer
+  draws into an offscreen framebuffer on the Mac's GPU, with a second color
+  attachment for one auxiliary buffer. AGL renderer
   queries describe the host's renderers for the virtual main display;
   pixel formats hold host CGL formats, though requested attributes are not
-  yet enforced. At
-  `aglSwapBuffers` cocaine reads the frame back and copies it into the
+  yet enforced. `aglGetVersion` calls the guest's own implementation so
+  applications see the AGL library's version rather than an unfilled answer;
+  `aglGetDrawable` returns the guest port previously set on that context.
+  Stellarium's immediate-mode RGB float colors, double-vector vertices,
+  double/integer texture coordinates, line stippling, light queries and
+  texture readback also go to the host. Vector values and light results
+  use the guest's byte order; texture readback honors its pixel pack state.
+  At
+  `aglSwapBuffers` cocaine reads the frame back through a per-context pixel
+  pack buffer, letting the GPU untile and convert the pixels rather than
+  doing that work on the CPU. The buffer is resized with the drawable and
+  mapped immediately for the current frame, without adding a frame of latency;
+  the guest's pixel pack state is restored afterwards. cocaine copies it into the
   game window's own pixels, converting to RGB555 for a 16-bit QuickDraw
   pixmap, then marks the window changed and has the
   guest's QuickDraw flush it, the way a game that drew in software did. The
@@ -285,8 +375,14 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   NSOpenGLView uses CGL instead: cocaine takes over CGL context creation,
   connects the offscreen framebuffer to the window server's surface bounds,
   and at `CGLFlushDrawable` draws the read-back pixels into the guest window
-  through its CoreGraphics window context. GL Golf uses this path and GLU's
-  quadrics, mipmaps, and perspective functions. CGL fullscreen contexts use
+  through its CoreGraphics window context. Leopard's private CGL parameter
+  1236 holds an opaque guest word per context, so Preview can retrieve it
+  without passing a synthetic context handle into Leopard's CGL code.
+  GL Golf uses this path and GLU's
+  quadrics, mipmaps, and perspective functions. Chess also uses GLU's camera
+  and disk functions: these run on the host because Leopard's `gluLookAt`
+  expects a guest OpenGL context, and quadric handles refer to host objects.
+  CGL fullscreen contexts use
   the captured guest display's dimensions and borrowed
   `CGDisplayGetDrawingContext` instead, drawing the same read-back image at
   the display's origin. Clearing or replacing the drawable leaves fullscreen;
@@ -301,7 +397,13 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   Passing compression through preserves their full source resolution.
   AGL and CGL presentation is capped at 120 frames a second by default to
   reduce latency for app-drawn cursors; `COCAINE_GL_FPS` overrides it,
-  including `60` for the former limit and `0` for no limit.
+  including `60` for the former limit and `0` for no limit. By default the
+  pacing wait precedes presentation. View > Low Latency opts into presenting
+  first and waiting before the swap returns, so a game can sample newer input
+  before drawing; it does not change the frame cap. The viewer and guest
+  processes share a session-scoped control file, so the menu takes effect
+  during a run. `COCAINE_GL_LOW_LATENCY=1` enables it initially and still
+  works without a session.
   Before starting guest code, Snes9x HQ! gets a default `COCAINE_UI_SCALE=1`:
   its game window is partly off-screen at 2x. It uses a 1280x800 guest
   display and doubled viewer pixels to keep menus large. Programs linked to
@@ -338,7 +440,11 @@ Moved from the README on 2026-11-18. The design of each piece, with the reasons;
   cocaine either, so the output units (AUHAL, default and system output)
   are done the same way, on the same thread: their render callbacks are
   called for the format the guest set (16- or 32-bit, either byte order,
-  interleaved or not, resampled if the rate differs), and requests for any
+  interleaved or not, resampled if the rate differs). When a guest connects
+  an upstream audio unit instead of setting a callback, the worker pulls
+  it with the guest's `AudioUnitRender` in the source's output format.
+  Leopard's speech synthesizer uses this path; without it speech stayed busy
+  forever and Chess could spin waiting for an announcement. Requests for any
   other kind of component go on to the guest's own Component Manager. The
   times the guest is told are what matters most: a sample's host time is
   when it will really be heard, measured on the guest's clock (which ticks

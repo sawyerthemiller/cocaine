@@ -523,6 +523,8 @@ class Translator : Emitter {
   void cmp_imm(int rn, u32 v) {
     if (v < 4096) {
       e(cmpw_i(rn, v));
+    } else if ((v & 0xFFF) == 0 && (v >> 12) < 4096) {
+      e(subsw_i(ZR, rn, v >> 12, true));
     } else {
       imm(S1, v);
       e(cmpw(rn, S1));
@@ -1106,10 +1108,13 @@ bool Translator::one(u32 insn) {
     case 12:
     case 13: {  // addic, addic.
       const int a = R(ra, T0), d = D(rd, T0);
-      if ((u32)simm < 4096) {
-        e(addsw_i(d, a, (u32)simm));
+      const u32 value = (u32)simm;
+      if (value < 4096) {
+        e(addsw_i(d, a, value));
+      } else if ((value & 0xFFF) == 0 && (value >> 12) < 4096) {
+        e(addsw_i(d, a, value >> 12, true));
       } else {
-        imm(T1, (u32)simm);
+        imm(T1, value);
         e(addsw(d, a, T1));
       }
       W(rd, d);
@@ -1839,7 +1844,37 @@ bool Translator::op63(u32 insn) {  // double precision arithmetic, and the rest
     case 72: FR(fb, 0); FW(fd, 0); return false;                                    // fmr
     case 136: FR(fb, 0); e(fabsd(0, 0)); e(fnegd(0, 0)); FW(fd, 0); return false;   // fnabs
     case 264: FR(fb, 0); e(fabsd(0, 0)); FW(fd, 0); return false;                   // fabs
-    default:  // conversions that round, and everything that touches FPSCR
+    case 583:  // mffs
+      load_state(S0, OFF(fpscr));
+      e(movzx(S1, 0xFFF8, 3));
+      e(orrx(S0, S1, S0));
+      e(strx_at(S0, ST, fpr_at((u32)fd)));
+      return false;
+    case 711: {  // mtfsf
+      const u32 fm = (insn >> 17) & 0xFF;
+      u32 mask = 0;
+      for (int i = 0; i < 8; i++) {
+        if (fm & (1u << i)) mask |= 0xFu << (4 * i);
+      }
+      if (!mask) return false;
+      load_state(S0, OFF(fpscr));
+      e(ldrw_at(T0, ST, fpr_at((u32)fb)));
+      e(eorw(T1, S0, T0));
+      if (mask & 3) {
+        // Changing the rounding mode also changes host thread state.
+        e(tstw_i(T1, mask32(3)));
+        rarely(forward(bcond(NE, 0), 19));
+      }
+      if (mask != 0xFFFFFFFFu) {
+        imm(S1, mask);
+        e(andw(T1, T1, S1));
+      }
+      e(eorw(S0, S0, T1));
+      store_state(S0, OFF(fpscr));
+      rejoin();
+      return false;
+    }
+    default:  // conversions that round, and other FPSCR instructions
       fallback(false);
       return false;
   }

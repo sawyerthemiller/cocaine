@@ -18,6 +18,37 @@ struct ArchitectureTests {
     var pef = Array("Joy!peffpwpc".utf8) + [0, 0, 0, 1] + Array(repeating: UInt8(0), count: 24)
     pef[33] = 3
     try check("pef", pef, [.powerpc, .classicPEF])
+    let ppcMachO: [UInt8] = [0xfe, 0xed, 0xfa, 0xce, 0, 0, 0, 18]
+    let intelMachO: [UInt8] = [0xce, 0xfa, 0xed, 0xfe, 7, 0, 0, 0]
+    let universal: [UInt8] = [0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2] +
+      [0, 0, 0, 18] + Array(repeating: 0, count: 16) +
+      [0, 0, 0, 7] + Array(repeating: 0, count: 16)
+    for name in ["Halo Demo", "Halo"] {
+      let halo = dir.appendingPathComponent(name)
+      for header in [pef, ppcMachO, intelMachO, universal] {
+        try Data(header).write(to: halo)
+        precondition(AppModel.legacyTextureFilterForRun(halo, inherited: [:]) == "1",
+                     "missing Halo preset for \(name)")
+        for override in ["0", "1"] {
+          precondition(AppModel.legacyTextureFilterForRun(halo, inherited: ["COCAINE_GL_LEGACY_TEXTURE_FILTER": override]) == nil)
+        }
+      }
+      try Data([0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1]).write(to: halo)
+      precondition(AppModel.legacyTextureFilterForRun(halo, inherited: [:]) == nil)
+    }
+    precondition(AppModel.legacyTextureFilterForRun(dir.appendingPathComponent("pef"), inherited: [:]) == nil)
+    let haloBundle = dir.appendingPathComponent("Halo.app")
+    let haloContents = haloBundle.appendingPathComponent("Contents")
+    let haloMacOS = haloContents.appendingPathComponent("MacOS")
+    try FileManager.default.createDirectory(at: haloMacOS, withIntermediateDirectories: true)
+    let haloPlist = ["CFBundleExecutable": "Halo", "CFBundlePackageType": "APPL",
+                     "CFBundleIdentifier": "test.cocaine.halo"]
+    try PropertyListSerialization.data(fromPropertyList: haloPlist, format: .xml, options: 0)
+      .write(to: haloContents.appendingPathComponent("Info.plist"))
+    let haloExecutable = haloMacOS.appendingPathComponent("Halo")
+    try Data(universal).write(to: haloExecutable)
+    precondition(AppModel.legacyTextureFilterForRun(haloBundle, inherited: [:]) == "1")
+    precondition(AppModel.legacyTextureFilterForRun(haloExecutable, inherited: [:]) == "1")
     let bundle = dir.appendingPathComponent("Extensionless Application")
     let contents = bundle.appendingPathComponent("Contents")
     let macOS = contents.appendingPathComponent("MacOS")

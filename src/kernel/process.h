@@ -127,6 +127,11 @@ class Process {
   // Runs until the guest exits or cannot continue. Returns the exit status.
   int run();
 
+  bool low_latency_pacing(bool fallback) const {
+    const uint32_t* state = pacing_control_.load(std::memory_order_acquire);
+    return state ? __atomic_load_n(state, __ATOMIC_RELAXED) != 0 : fallback;
+  }
+
   // Called from the host signal handler when a memory access faults.
   void report_fault(int sig, const void* host_addr, const void* context = nullptr);
   bool guest_writable(u32 addr) const;  // whether the guest may write the page at addr
@@ -163,6 +168,7 @@ class Process {
                    bool push_header, u32 header_addr, u32& sp, std::string& err);
   int run_ppc(Thread& t);
   int run_x86(Thread& t);
+  void report_stats() const;
   void dump_registers(const Thread& t) const;
   // The mapped library holding guest address `pc`, and how far into it, for crash reports.
   const char* image_of(u32 pc, u32& offset) const;
@@ -190,7 +196,10 @@ class Process {
   SysRet sys_getattrlist(const std::string& path, u32 list, u32 buf, u32 size, u32 options);
   SysRet sys_setattrlist(const std::string& path, u32 list, u32 buf, u32 size, u32 options);
   int open_appledouble_fork(const std::string& host, int flags);
+  int open_resolver_config(const std::string& host, int flags);
   SysRet sys_socket_call(u32 num, SysArgs& a);
+  int route_socket(int fd) const;
+  SysRet sys_route_io(int fd, u32 buf, u32 len, bool writing);
   void write_stat(u32 buf, const struct stat& st, bool wide);
   u32 machdep_call(Thread& t, u32 num, SysArgs& a);
   void ppc_fast_trap(Thread& t, u32 num);
@@ -248,6 +257,7 @@ class Process {
   u64 display_source_bytes_ = 0, display_file_pixels_ = 0;
   u32 display_w_ = 0, display_h_ = 0;
   u32 display_stride_ = 0, display_bits_ = 32;
+  std::vector<u8> display_conversion_;
   std::mutex publish_mu_;
   std::atomic<u64> hook_published_ns_{0};  // when publish_display last ran
   bool publish_changed();  // with publish_mu_ held
@@ -329,6 +339,7 @@ class Process {
   u32 pthread_size_ = 0;   // size of its per-thread structure
   std::atomic<bool> exited_{false};
   int exit_code_ = 0;
+  u64 run_started_ = 0;
   std::set<u32> warned_bsd_, warned_mach_, warned_msg_;
 
   std::map<u32, KPort> kports_;  // the ports that are kernel objects, by name
@@ -367,6 +378,7 @@ class Process {
   u32 bootstrap_port_ = 0;
   bool owns_bootstrap_ = false;
   std::string session_name_;  // empty until the session has a server
+  std::atomic<uint32_t*> pacing_control_{nullptr};
   // For a guest told it is root: the user and group it has since switched
   // itself to (real and effective of each). A daemon drops to a lesser user
   // and takes root back, and expects both to work.

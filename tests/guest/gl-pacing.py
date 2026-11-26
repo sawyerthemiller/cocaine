@@ -18,8 +18,11 @@ fmt = agl.aglChoosePixelFormatCFM(None, 0, attrs)
 ctx = agl.aglCreateContextCFM(fmt, 0)
 assert fmt and ctx and agl.aglSetCurrentContext(ctx)
 start = time.time()
-for i in range(100):
+first = None
+for i in range(3 if sys.argv[1] == "low-1" else 100):
     agl.aglSwapBuffers(ctx)
+    if i == 0:
+        first = time.time() - start
 elapsed = time.time() - start
 assert agl.aglSetCurrentContext(0)
 assert agl.aglDestroyContext(ctx)
@@ -27,8 +30,13 @@ agl.aglDestroyPixelFormat(fmt)
 
 if sys.argv[1] == "default":
     assert 0.65 <= elapsed < 1.25, elapsed
-elif sys.argv[1] == "60":
+elif sys.argv[1] in ("60", "low-60"):
     assert 1.4 <= elapsed < 2.2, elapsed
+    if sys.argv[1] == "low-60":
+        assert first >= 0.01, first
+elif sys.argv[1] == "low-1":
+    assert 2.8 <= elapsed < 6.0, elapsed
+    assert first >= 0.8, first
 else:
-    assert sys.argv[1] == "0" and elapsed < 0.45, elapsed
+    assert sys.argv[1] in ("0", "low-0") and elapsed < 0.45, elapsed
 print "GL pacing ok"

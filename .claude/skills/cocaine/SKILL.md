@@ -98,6 +98,10 @@ error such as IOKit's `kNotFound`.
   "no such service". configd was added on 2026-11-18 after the Apple menu
   crashed in SCPreferences without it. Leopard 10.5.6's window server needs
   `hidd` and waits for `com.apple.iohideventsystem` until it starts.
+- `pboard` supplies the guest session's pasteboard; lookups wait until it
+  checks in so its shared memory exists before clients use it. The viewer's
+  clipboard bridge connects text, images and files to macOS using a guest
+  Python 2.5 helper.
 - `kExtraArguments`: configd runs with `-b` (no plug-ins: they'd manage the
   Mac's real network, power, Bluetooth) and `-d` (stay in the foreground: it
   only does so for launchd as pid 1, and guests see the session server's pid).

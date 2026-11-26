@@ -152,11 +152,37 @@ int main() {
     header.height = 480;
     header.frame += 2;
     [view show];
+    const std::string session = "cocaine.session." + std::to_string(getpid()) + ".viewer-test";
+    const std::string controlPath = session_pacing_path(session);
+    uint32_t* reader = create_session_pacing(session, true, error);
+    uint32_t* writer = open_session_pacing(session, true, error);
+    if (!reader || !writer || __atomic_load_n(reader, __ATOMIC_RELAXED) != 1) {
+      fprintf(stderr, "cannot initialize viewer pacing test: %s\n", error.c_str());
+      return 1;
+    }
+    struct ControlCleanup {
+      std::string path;
+      uint32_t *reader, *writer;
+      ~ControlCleanup() {
+        munmap(reader, sizeof *reader);
+        munmap(writer, sizeof *writer);
+        unlink(path.c_str());
+        rmdir(path.substr(0, path.rfind('/')).c_str());
+      }
+    } cleanup{controlPath, reader, writer};
+    view->pacingControl = writer;
     NSMenu* menu = [[NSMenu alloc] initWithTitle:@"View"];
+    NSMenuItem* latency = [menu addItemWithTitle:@"Low Latency" action:@selector(toggleLowLatency:)
+                                   keyEquivalent:@""];
+    latency.state = NSControlStateValueOn;
     for (ViewerScale mode : {ViewerScale::Actual, ViewerScale::Integer, ViewerScale::Fit}) {
-      NSMenuItem* item = [menu addItemWithTitle:@"scale" action:nil keyEquivalent:@""];
+      NSMenuItem* item = [menu addItemWithTitle:@"scale" action:@selector(chooseScale:) keyEquivalent:@""];
       item.tag = (NSInteger)mode;
       [view chooseScale:item];
+      if (latency.state != NSControlStateValueOn) {
+        fprintf(stderr, "scale selection changed the latency checkmark\n");
+        return 1;
+      }
       [window setContentSize:NSMakeSize(1000, 800)];
       [view layoutSubtreeIfNeeded];
       const NSRect image = [view imageRect];
@@ -186,6 +212,23 @@ int main() {
         return 1;
       }
     }
+    for (uint32_t expectedValue : {0u, 1u}) {
+      [view toggleLowLatency:latency];
+      if (__atomic_load_n(reader, __ATOMIC_RELAXED) != expectedValue ||
+          latency.state != (expectedValue ? NSControlStateValueOn : NSControlStateValueOff)) {
+        fprintf(stderr, "latency menu did not update shared state and checkmark\n");
+        return 1;
+      }
+      NSMenuItem* choice = menu.itemArray.lastObject;
+      [view chooseScale:choice];
+      if (choice.state != NSControlStateValueOn ||
+          latency.state != (expectedValue ? NSControlStateValueOn : NSControlStateValueOff)) {
+        fprintf(stderr, "scale and latency checkmarks are not independent\n");
+        return 1;
+      }
+    }
+    [window setContentSize:NSMakeSize(1000, 800)];
+    [view layoutSubtreeIfNeeded];
     int input[2];
     if (pipe(input) != 0) return 1;
     const int output = dup(STDOUT_FILENO);

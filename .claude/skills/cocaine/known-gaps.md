@@ -2,11 +2,29 @@
 
 Moved from the README on 2026-11-18. What doesn't work yet, or works only partly, and why. The README keeps a short list of the ones a user would notice.
 
+- Network reachability lookups work for the tested IPv4 and IPv6 addresses
+  on both CPUs, but PowerPC route translation only supports lookup writes
+  and ordinary reads and writes; other routing messages and APIs are not
+  fully translated. A headless PowerPC Safari 3.1.2 startup loaded its error
+  page for the default URL; the cause has not been established. The DNS fallback reads the host's
+  resolver file on each open, but that file does not describe every macOS
+  VPN or split-DNS configuration. It does not make the missing guest file
+  visible to `stat`, and old TLS implementations may not work with modern sites.
 - PowerPC PEF/CFM launch is experimental. EV Nova 1.0.0 initializes its
   registration tool on 10.5.6 with `F_PREALLOCATE` implemented. The tested
   installation's unregistered trial reports a scenario checksum mismatch;
   whether the files or the environment cause it is not established.
   Do not bypass the game's registration or integrity checks.
+- Halo Demo's PEF version reaches gameplay with ARB assembly programs and
+  generic vertex arrays. Foliage renders after fixing stale vertex attributes,
+  and the launcher preset fixes the radar's missing minification filter.
+  Preserving the cursor position during keyboard events fixes the camera
+  jumps reported when holding a movement key through respawn. The same
+  launcher preset fixes dark gun-smoke blocks by limiting compressed
+  textures to their supplied mip chain, keeping their mipmapped filters.
+  The radar, respawn input and smoke fixes were confirmed after restarting.
+  The launcher also enables the preset for full Halo and 32-bit Intel
+  Halo/Halo Demo; those versions have not yet been verified in gameplay.
 - Ghost Recon Demo's extensionless app bundle is recognized and loads via
   LaunchCFMApp. With volume metadata fixed it gets past its installation
   check and reaches its menu using the AGL and GLU hooks. The checked
@@ -15,6 +33,9 @@ Moved from the README on 2026-11-18. What doesn't work yet, or works only partly
   The launcher retains its 800x600 starting display as a compatibility
   default. The user confirmed that gameplay displays after the larger
   mode switch was fixed.
+- Leopard's PowerPC Chess accepted several moves with spoken announcements
+  and computer replies in a headless check. Pixel-format requests are not
+  enforced, and speech recognition could not launch.
 - AppleDouble resource forks are exposed read-only from temporary files when
   native metadata is missing. Their file descriptors do not retain the
   original fork's path, and writable sidecar forks are not supported.
@@ -34,12 +55,16 @@ Moved from the README on 2026-11-18. What doesn't work yet, or works only partly
   functions used by the games tested so far: much of OpenGL 1.x, some AGL,
   CGL and GLU calls, and OpenAL 1.1's playback calls. Another game will want others, which
   announce themselves on the first call ("... is not passed through to the
-  Mac yet"). AGL and CGL pixel-format requests are logged but not enforced: the
+  Mac yet"). ARB vertex and fragment programs are advertised for Halo, but
+  some of their entry points remain unsupported. AGL and CGL pixel-format requests are logged but not enforced: the
   existing fixed accelerated format is used instead. CGL fullscreen draws
   into the captured guest display (Postal 2's animated intro and menu render).
   AGL fullscreen (`aglSetFullScreen`) isn't done, so AGL games have to
-  be set to play in a window. DrawSprocket runs as guest code; Ghost Recon
-  Demo uses it to select the virtual display's 640x480 menu modes.
+  use a window or DrawSprocket instead. DrawSprocket runs as guest code;
+  Ghost Recon Demo uses it to select the virtual display's 640x480 menu
+  modes, and Marble Blast Gold can switch to fullscreen and back on the
+  checked 10.5.6 PowerPC libraries. Its depth-search loop is corrected in
+  memory so 32-bit requests do not select a 16-bit mode.
 - Sound comes out of one stereo 44.1 kHz device, with no input. The guest's
   Component Manager finds no components at all under cocaine (why is not
   known yet); the output units are supplied instead, but other components
@@ -108,8 +133,11 @@ Moved from the README on 2026-11-18. What doesn't work yet, or works only partly
   is interpreted. The less common AltiVec and floating point instructions
   are handed to the interpreter one at a time, so code that is mostly
   those runs no faster than before.
-- The pasteboard server isn't running, so copy and paste between apps
-  doesn't work.
+- The viewer's macOS clipboard bridge handles plain text, RTF, HTML,
+  TIFF/PNG/JPEG images and file references, not other clipboard formats such
+  as RTFD attachments. Staged folders reject
+  absolute or parent-relative symbolic links; headless runs have a guest
+  pasteboard but no host bridge.
 - The daemons start afresh with each run that needs them, which costs a
   second or so every time.
 - `task_for_pid` finds guest processes in the same session once they have

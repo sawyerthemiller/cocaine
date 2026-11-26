@@ -32,6 +32,7 @@
 #include <OpenGL/glu.h>
 
 #include <cmath>
+#include <cctype>
 #include <ctime>
 #include <cstring>
 #include <memory>
@@ -44,6 +45,7 @@
 #include "kernel/display_pixels.h"
 #include "kernel/hooks.h"
 #include "kernel/process.h"
+#include "session/pacing.h"
 
 namespace {
 
@@ -121,6 +123,7 @@ struct Doubles {
 
 struct Array {
   bool on = false;
+  GLboolean normalized = GL_FALSE;
   GLint size = 4;
   GLenum type = GL_FLOAT;
   GLsizei stride = 0;
@@ -131,6 +134,7 @@ struct Array {
 struct ClientArrays {
   Array vertex, normal, color;
   Array tex[8];
+  std::vector<Array> attribs;
   int unit = 0;
   GLbitfield mask = 0;
   bool unpack_swap = false, pack_swap = false;
@@ -142,25 +146,42 @@ struct SurfaceFunctions {
   u32 display_context = 0;
 };
 
+struct TextureMipRange {
+  GLint requested = 1000;
+  GLint applied = 1000;
+};
+
+struct SharedTextures {
+  std::mutex mutex;
+  std::unordered_map<GLuint, TextureMipRange> mip_ranges;
+};
+
 struct Context {
   u32 handle = 0;
   u32 refs = 1;
   CGLContextObj cgl = nullptr;
-  GLuint fbo = 0, color = 0, depth = 0;
+  GLuint fbo = 0, color = 0, auxiliary = 0, depth = 0;
   int width = 0, height = 0;
   u32 port = 0;
   u32 connection = 0, window = 0, surface = 0;
   u32 display = 0;
+  u32 private_client_storage = 0;
+  u32 surface_color_space = 0, surface_provider = 0;
   u32 surface_rect = 0, window_rect = 0, guest_frame = 0, guest_frame_size = 0;
   float surface_x = 0, surface_y = 0;
   SurfaceFunctions surface_functions;
   bool unpack_swap = false, pack_swap = false;  // what the guest asked for
   Array vertex, normal, color_array;
   Array tex[8];
+  std::vector<Array> attribs;
+  bool attribs_ready = false;
   int client_unit = 0;
   std::vector<ClientArrays> client_stack;
   std::vector<u8> frame;
+  GLuint readback = 0;
+  size_t readback_size = 0;
   u32 frames = 0;
+  std::shared_ptr<SharedTextures> textures = std::make_shared<SharedTextures>();
 };
 
 std::mutex g_mu;
@@ -218,12 +239,16 @@ void size_framebuffer(Context* x, int w, int h) {
   if (!x->fbo) {
     glGenFramebuffersEXT(1, &x->fbo);
     glGenRenderbuffersEXT(1, &x->color);
+    glGenRenderbuffersEXT(1, &x->auxiliary);
     glGenRenderbuffersEXT(1, &x->depth);
   }
   glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, x->fbo);
   glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, x->color);
   glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_RGBA8, w, h);
   glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_RENDERBUFFER_EXT, x->color);
+  glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, x->auxiliary);
+  glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_RGBA8, w, h);
+  glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT1_EXT, GL_RENDERBUFFER_EXT, x->auxiliary);
   glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, x->depth);
   glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_DEPTH24_STENCIL8_EXT, w, h);
   glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, x->depth);
@@ -251,7 +276,14 @@ bool port_size(GuestCall& c, u32 port, int& w, int& h) {
   return w > 0 && h > 0;
 }
 
-void read_frame(Context* x) {
+bool read_frame(Context* x) {
+  if (!x->readback) glGenBuffers(1, &x->readback);
+  if (!x->readback) {
+    log_warn("OpenGL: cannot create frame readback buffer");
+    return false;
+  }
+  GLint pack = 0;
+  glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
   glPushClientAttrib(GL_CLIENT_PIXEL_STORE_BIT);
   glPixelStorei(GL_PACK_ALIGNMENT, 4);
   glPixelStorei(GL_PACK_ROW_LENGTH, 0);
@@ -261,12 +293,35 @@ void read_frame(Context* x) {
   GLint read = 0;
   glGetIntegerv(GL_READ_BUFFER, &read);
   glReadBuffer(GL_COLOR_ATTACHMENT0_EXT);
-  // Packed so that each pixel lands in memory in the guest's own order: A R G B
-  // on PowerPC, B G R A on Intel.
-  glReadPixels(0, 0, x->width, x->height, GL_BGRA, g_big ? GL_UNSIGNED_INT_8_8_8_8 : GL_UNSIGNED_INT_8_8_8_8_REV,
-               x->frame.data());
+  // A pack buffer lets the GPU untile the image instead of doing it on the CPU.
+  // Map this frame immediately: no extra frame of presentation latency.
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, x->readback);
+  if (x->readback_size != x->frame.size()) {
+    glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)x->frame.size(), nullptr, GL_STREAM_READ);
+    GLint allocated = 0;
+    glGetBufferParameteriv(GL_PIXEL_PACK_BUFFER, GL_BUFFER_SIZE, &allocated);
+    x->readback_size = allocated > 0 ? (size_t)allocated : 0;
+  }
+  bool ok = false;
+  if (x->readback_size != x->frame.size()) {
+    log_warn("OpenGL: cannot allocate frame readback buffer (%zu bytes)", x->frame.size());
+  } else {
+    // A R G B on PowerPC, B G R A on Intel.
+    glReadPixels(0, 0, x->width, x->height, GL_BGRA,
+                 g_big ? GL_UNSIGNED_INT_8_8_8_8 : GL_UNSIGNED_INT_8_8_8_8_REV, nullptr);
+    const void* pixels = glMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
+    if (pixels) {
+      memcpy(x->frame.data(), pixels, x->frame.size());
+      ok = glUnmapBuffer(GL_PIXEL_PACK_BUFFER) == GL_TRUE;
+      if (!ok) log_warn("OpenGL: frame readback buffer became invalid");
+    } else {
+      log_warn("OpenGL: cannot map frame readback buffer");
+    }
+  }
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
   glReadBuffer((GLenum)read);
   glPopClientAttrib();
+  return ok;
 }
 
 void frame_shown(Context* x, const char* kind) {
@@ -287,7 +342,7 @@ void frame_shown(Context* x, const char* kind) {
 // The frame, into the guest window's pixels, and onto the screen.
 void present(GuestCall& c, Context* x) {
   if (!x->port || !x->fbo) return;
-  read_frame(x);
+  if (!read_frame(x)) return;
   static u32 lock, unlock, pixmap, base, rowbytes, pixdepth, pixbounds, flush, dirty, rect, whole;
   if (!lock) {
     lock = c.symbol("LockPortBits");
@@ -369,6 +424,15 @@ void present(GuestCall& c, Context* x) {
 }
 
 // ---- AGL ------------------------------------------------------------------------
+
+void aglGetVersion(GuestCall& c) {
+  const u32 major = c.i(), minor = c.i();
+  if (!c.original()) {
+    log_warn("OpenGL: the guest's aglGetVersion is unavailable");
+    return;
+  }
+  c.call(c.original(), {major, minor});
+}
 
 u32 choose_pixel_format(GuestCall& c, u32 attribs, const char* api) {
   g_big = c.powerpc;
@@ -478,6 +542,7 @@ void aglDescribePixelFormat(GuestCall& c) {
   }
   agl_error(error, "describing a pixel format");
   if (error != kCGLNoError) return c.ret(0);
+  if (attr == 7) value = 1;
   c.mem.w32(out, (u32)value);
   c.ret(1);
 }
@@ -591,6 +656,7 @@ u32 create_context(GuestCall& c, u32 format, u32 share) {
     return 0;
   }
   auto* x = new Context;
+  if (shared) x->textures = shared->textures;
   const CGLError e = CGLCreateContext(pf, shared ? shared->cgl : nullptr, &x->cgl);
   CGLReleasePixelFormat(pf);
   if (e != kCGLNoError) {
@@ -619,7 +685,20 @@ void make_current(Context* x) {
     glPixelStorei(GL_UNPACK_SWAP_BYTES, g_big);  // big-endian pixels read the guest's way
     glPixelStorei(GL_PACK_SWAP_BYTES, g_big);
   }
+  if (!x->attribs_ready) {
+    GLint max_attribs = 0;
+    glGetIntegerv(GL_MAX_VERTEX_ATTRIBS_ARB, &max_attribs);
+    if (max_attribs > 0) x->attribs.resize((size_t)max_attribs);
+    else log_warn("OpenGL: cannot determine the vertex attribute limit");
+    x->attribs_ready = true;
+  }
   glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, x->fbo);
+}
+
+void release_surface_provider(GuestCall& c, Context* x) {
+  if (!x->surface_provider) return;
+  c.call(x->surface_functions.release_provider, {x->surface_provider});
+  x->surface_provider = 0;
 }
 
 void aglSetCurrentContext(GuestCall& c) {
@@ -647,9 +726,14 @@ CGLError release_context(GuestCall& c, u32 handle) {
     CGLSetCurrentContext(x->cgl);
     glDeleteFramebuffersEXT(1, &x->fbo);
     glDeleteRenderbuffersEXT(1, &x->color);
+    glDeleteRenderbuffersEXT(1, &x->auxiliary);
     glDeleteRenderbuffersEXT(1, &x->depth);
+    if (x->readback) glDeleteBuffers(1, &x->readback);
     CGLSetCurrentContext(before);
   }
+  release_surface_provider(c, x);
+  if (x->surface_color_space)
+    c.call(x->surface_functions.release_color, {x->surface_color_space});
   const CGLError error = CGLDestroyContext(x->cgl);
   if (x->guest_frame) c.mem.unmap(x->guest_frame, x->guest_frame_size);
   delete x;
@@ -691,39 +775,64 @@ void aglSetDrawable(GuestCall& c) {
   c.ret(x != nullptr);
 }
 
+void aglGetDrawable(GuestCall& c) {
+  Context* x = context_of(c.i());
+  agl_error(x ? kCGLNoError : kCGLBadContext, "getting a drawable");
+  c.ret(x ? x->port : 0);
+}
+
 void aglUpdateContext(GuestCall& c) {
   Context* x = context_of(c.i());
   if (x && x->port) resize_to_port(c, x);
   c.ret(x != nullptr);
 }
 
-// Frames are shown at most this often (COCAINE_GL_FPS, 120 unless set): a
-// Mac of the time held a game to the display's refresh, and frames past what
-// the screen shows only cost power, twice over, since the guest's window
-// server composites each one.
-void pace() {
+bool low_latency_pacing(GuestCall& c) {
+  static const bool enabled = initial_low_latency_pacing();
+  return c.process.low_latency_pacing(enabled);
+}
+
+// Pace before presentation by default. In low-latency mode, show the frame
+// first and wait before returning to the game, so it can sample newer input.
+thread_local u64 pacing_next = 0;
+
+void pace(bool after = false) {
   static const double interval = [] {
     double fps = 120;
     if (const char* e = getenv("COCAINE_GL_FPS")) fps = atof(e);
     return fps >= 1 ? 1e9 / fps : 0.0;
   }();
   if (interval <= 0) return;
-  static thread_local u64 next = 0;
   const u64 now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-  if (next > now && next - now < 1000000000ull) {
-    struct timespec ts = {0, (long)(next - now)};
+  if (after && !pacing_next) pacing_next = now + (u64)interval;
+  if (pacing_next > now && pacing_next - now <= 1000000000ull) {
+    const u64 delay = pacing_next - now;
+    struct timespec ts = {(time_t)(delay / 1000000000ull), (long)(delay % 1000000000ull)};
     nanosleep(&ts, nullptr);
-    next += (u64)interval;
+    pacing_next += (u64)interval;
   } else {
-    next = now + (u64)interval;  // late, or the first frame: start the beat from here
+    pacing_next = now + (u64)interval;  // late, or the first frame: start the beat from here
   }
+}
+
+void pace_before_presentation(bool after) {
+  static thread_local bool initialized = false, previous_after = false;
+  if (initialized && after != previous_after) {
+    if (after) pace();
+    else pacing_next = 0;
+  }
+  initialized = true;
+  previous_after = after;
+  if (!after) pace();
 }
 
 void aglSwapBuffers(GuestCall& c) {
   Context* x = context_of(c.i());
   if (x && x == t_current) {
-    pace();
+    const bool after = low_latency_pacing(c);
+    pace_before_presentation(after);
     present(c, x);
+    if (after) pace(true);
   }
   c.ret(0);
 }
@@ -805,6 +914,7 @@ void cglDescribePixelFormat(GuestCall& c) {
   if (it == g_formats.end()) return c.ret(kCGLBadPixelFormat);
   GLint value = 0;
   const CGLError error = CGLDescribePixelFormat(it->second.cgl, index, (CGLPixelFormatAttribute)attribute, &value);
+  if (error == kCGLNoError && attribute == kCGLPFAAuxBuffers) value = 1;
   if (error == kCGLNoError) c.mem.w32(out, (u32)value);
   c.ret(error);
 }
@@ -988,7 +1098,10 @@ bool present_surface(GuestCall& c, Context* x) {
     return false;
   }
   if (bytes > x->guest_frame_size) {
-    if (x->guest_frame) c.mem.unmap(x->guest_frame, x->guest_frame_size);
+    if (x->guest_frame) {
+      release_surface_provider(c, x);
+      c.mem.unmap(x->guest_frame, x->guest_frame_size);
+    }
     x->guest_frame = c.mem.map_alone(bytes, GuestMemory::kRead | GuestMemory::kWrite, 0x10000000u, 0xC0000000u);
     x->guest_frame_size = x->guest_frame ? (u32)bytes : 0;
   }
@@ -996,7 +1109,7 @@ bool present_surface(GuestCall& c, Context* x) {
     say_once("OpenGL: cannot allocate Cocoa surface pixels");
     return false;
   }
-  read_frame(x);
+  if (!read_frame(x)) return false;
   const size_t row = (size_t)x->width * 4;
   for (int y = 0; y < x->height; y++)
     memcpy(c.mem.host(x->guest_frame) + (size_t)y * row,
@@ -1014,8 +1127,10 @@ bool present_surface(GuestCall& c, Context* x) {
   }
   const u32 ctx = x->display ? c.call(fn.display_context, {x->display})
                              : c.call(fn.window_context, {x->connection, x->window, 0});
-  const u32 space = c.call(fn.color_space, {});
-  const u32 source = c.call(fn.provider, {0, x->guest_frame, (u32)bytes, 0});
+  if (!x->surface_color_space) x->surface_color_space = c.call(fn.color_space, {});
+  if (!x->surface_provider) x->surface_provider = c.call(fn.provider, {0, x->guest_frame, (u32)bytes, 0});
+  const u32 space = x->surface_color_space;
+  const u32 source = x->surface_provider;
   u32 image = 0;
   if (ctx && space && source) {
     const u32 bitmap = (u32)kCGImageAlphaNoneSkipFirst |
@@ -1033,8 +1148,6 @@ bool present_surface(GuestCall& c, Context* x) {
     say_once("OpenGL: cannot create an image for a Cocoa surface");
   }
   if (image) c.call(fn.release_image, {image});
-  if (source) c.call(fn.release_provider, {source});
-  if (space) c.call(fn.release_color, {space});
   // CGDisplayGetDrawingContext lends the display's context; only window
   // contexts created above belong to us.
   if (ctx && !x->display) c.call(fn.release_context, {ctx});
@@ -1061,22 +1174,48 @@ void cglUpdateContext(GuestCall& c) {
   c.ret(!x->surface || resize_to_surface(c, x) ? kCGLNoError : kCGLBadDrawable);
 }
 
+constexpr u32 kCGLCPPrivateGuestStorage = 1236;
+
 void cglSetParameter(GuestCall& c) {
-  Context* x = context_of(c.i());
+  const u32 handle = c.i();
   const u32 parameter = c.i(), address = c.i();
-  if (!x) return c.ret(kCGLBadContext);
+  std::lock_guard<std::mutex> lk(g_mu);
+  const auto it = g_contexts.find(handle);
+  if (it == g_contexts.end()) return c.ret(kCGLBadContext);
   if (!address || !c.mem.range_ok(address, 4, GuestMemory::kRead)) return c.ret(kCGLBadAddress);
-  const GLint value = (GLint)c.mem.r32(address);
+  const u32 value = c.mem.r32(address);
+  if (parameter == kCGLCPPrivateGuestStorage) {
+    it->second->private_client_storage = value;
+    return c.ret(kCGLNoError);
+  }
   if (parameter == kCGLCPSwapInterval) return c.ret(kCGLNoError);
-  log_warn("OpenGL: CGL context parameter %u is not supported (value %d)", parameter, value);
+  log_warn("OpenGL: CGL context parameter %u is not supported (value %d)", parameter, (GLint)value);
+  c.ret(kCGLBadEnumeration);
+}
+
+void cglGetParameter(GuestCall& c) {
+  const u32 handle = c.i();
+  const u32 parameter = c.i(), address = c.i();
+  std::lock_guard<std::mutex> lk(g_mu);
+  const auto it = g_contexts.find(handle);
+  if (it == g_contexts.end()) return c.ret(kCGLBadContext);
+  if (!address || !c.mem.range_ok(address, 4, GuestMemory::kWrite)) return c.ret(kCGLBadAddress);
+  if (parameter == kCGLCPPrivateGuestStorage) {
+    c.mem.w32(address, it->second->private_client_storage);
+    return c.ret(kCGLNoError);
+  }
+  log_warn("OpenGL: CGL context parameter %u is not supported", parameter);
   c.ret(kCGLBadEnumeration);
 }
 
 void cglFlushDrawable(GuestCall& c) {
   Context* x = context_of(c.i());
   if (!x || x != t_current) return c.ret(kCGLBadContext);
-  pace();
-  c.ret(present_surface(c, x) ? kCGLNoError : kCGLBadDrawable);
+  const bool after = low_latency_pacing(c);
+  pace_before_presentation(after);
+  const bool shown = present_surface(c, x);
+  if (after) pace(true);
+  c.ret(shown ? kCGLNoError : kCGLBadDrawable);
 }
 
 // ---- GL: state ----------------------------------------------------------------
@@ -1096,6 +1235,12 @@ void gluOrtho2D(GuestCall& c) {
 void gluPerspective_(GuestCall& c) {
   const double fovy = c.d(), aspect = c.d(), near = c.d(), far = c.d();
   gluPerspective(fovy, aspect, near, far);
+}
+void gluLookAt_(GuestCall& c) {
+  const double eye_x = c.d(), eye_y = c.d(), eye_z = c.d();
+  const double center_x = c.d(), center_y = c.d(), center_z = c.d();
+  const double up_x = c.d(), up_y = c.d(), up_z = c.d();
+  gluLookAt(eye_x, eye_y, eye_z, center_x, center_y, center_z, up_x, up_y, up_z);
 }
 std::unordered_map<u32, GLUquadric*> g_quadrics;
 GLUquadric* quadric_of(u32 handle) {
@@ -1137,6 +1282,12 @@ void gluQuadricTexture_(GuestCall& c) {
   if (!q) return log_warn("OpenGL: invalid GLU quadric");
   gluQuadricTexture(q, texture);
 }
+void gluQuadricOrientation_(GuestCall& c) {
+  GLUquadric* q = quadric_of(c.i());
+  const GLenum orientation = c.i();
+  if (!q) return log_warn("OpenGL: invalid GLU quadric");
+  gluQuadricOrientation(q, orientation);
+}
 void gluSphere_(GuestCall& c) {
   GLUquadric* q = quadric_of(c.i());
   const double radius = c.d();
@@ -1151,12 +1302,22 @@ void gluCylinder_(GuestCall& c) {
   if (!q) return log_warn("OpenGL: invalid GLU quadric");
   gluCylinder(q, base, top, height, slices, stacks);
 }
-void gluBuild2DMipmaps_(GuestCall& c) {
-  const GLenum target = c.i();
-  const GLint components = (GLint)c.i();
-  const GLsizei width = (GLsizei)c.i(), height = (GLsizei)c.i();
-  const GLenum format = c.i(), type = c.i();
-  const u32 data = c.i();
+void gluDisk_(GuestCall& c) {
+  GLUquadric* q = quadric_of(c.i());
+  const double inner = c.d(), outer = c.d();
+  const int slices = (s32)c.i(), loops = (s32)c.i();
+  if (!q) return log_warn("OpenGL: invalid GLU quadric");
+  gluDisk(q, inner, outer, slices, loops);
+}
+void gluPartialDisk_(GuestCall& c) {
+  GLUquadric* q = quadric_of(c.i());
+  const double inner = c.d(), outer = c.d();
+  const int slices = (s32)c.i(), loops = (s32)c.i();
+  const double start = c.d(), sweep = c.d();
+  if (!q) return log_warn("OpenGL: invalid GLU quadric");
+  gluPartialDisk(q, inner, outer, slices, loops, start, sweep);
+}
+int pixel_size(GLenum format, GLenum type) {
   int channels = 0, component_size = 0, packed_size = 0;
   switch (format) {
     case GL_COLOR_INDEX: case GL_STENCIL_INDEX: case GL_DEPTH_COMPONENT:
@@ -1176,7 +1337,16 @@ void gluBuild2DMipmaps_(GuestCall& c) {
     case GL_UNSIGNED_INT_8_8_8_8: case GL_UNSIGNED_INT_8_8_8_8_REV:
     case GL_UNSIGNED_INT_10_10_10_2: case GL_UNSIGNED_INT_2_10_10_10_REV: packed_size = 4; break;
   }
-  if (!channels || (!component_size && !packed_size)) {
+  return channels ? (packed_size ? packed_size : channels * component_size) : 0;
+}
+void gluBuild2DMipmaps_(GuestCall& c) {
+  const GLenum target = c.i();
+  const GLint components = (GLint)c.i();
+  const GLsizei width = (GLsizei)c.i(), height = (GLsizei)c.i();
+  const GLenum format = c.i(), type = c.i();
+  const u32 data = c.i();
+  const int bytes_per_pixel = pixel_size(format, type);
+  if (!bytes_per_pixel) {
     log_warn("OpenGL: unsupported GLU mipmap format 0x%x type 0x%x", format, type);
     return c.ret(GLU_INVALID_ENUM);
   }
@@ -1192,11 +1362,10 @@ void gluBuild2DMipmaps_(GuestCall& c) {
     log_warn("OpenGL: invalid GLU mipmap unpack state");
     return c.ret(GLU_INVALID_VALUE);
   }
-  const u64 pixel_size = packed_size ? (u64)packed_size : (u64)channels * component_size;
-  const u64 row_bytes = (u64)(row_length ? row_length : width) * pixel_size;
+  const u64 row_bytes = (u64)(row_length ? row_length : width) * bytes_per_pixel;
   const u64 stride = (row_bytes + alignment - 1) / alignment * alignment;
-  const u64 bytes = (u64)skip_rows * stride + (u64)skip_pixels * pixel_size +
-                    (u64)(height - 1) * stride + (u64)width * pixel_size;
+  const u64 bytes = (u64)skip_rows * stride + (u64)skip_pixels * bytes_per_pixel +
+                    (u64)(height - 1) * stride + (u64)width * bytes_per_pixel;
   if (!data || bytes > UINT32_MAX || !c.mem.range_ok(data, bytes, GuestMemory::kRead)) {
     log_warn("OpenGL: invalid GLU mipmap data");
     return c.ret(GLU_INVALID_VALUE);
@@ -1226,6 +1395,7 @@ void glBlendFunc_(GuestCall& c) {
   const GLenum s = c.i(), d = c.i();
   glBlendFunc(s, d);
 }
+void glBlendEquation_(GuestCall& c) { glBlendEquation(c.i()); }
 void glAlphaFunc_(GuestCall& c) {
   const GLenum f = c.i();
   glAlphaFunc(f, c.f());
@@ -1257,6 +1427,10 @@ void glPolygonOffset_(GuestCall& c) {
   glPolygonOffset(f, u);
 }
 void glLineWidth_(GuestCall& c) { glLineWidth(c.f()); }
+void glLineStipple_(GuestCall& c) {
+  const GLint factor = (GLint)c.i();
+  glLineStipple(factor, (GLushort)c.i());
+}
 void glHint_(GuestCall& c) {
   const GLenum t = c.i();
   glHint(t, c.i());
@@ -1269,6 +1443,7 @@ void glGetError_(GuestCall& c) { c.ret(glGetError()); }
 
 // The window's front and back buffers are one offscreen framebuffer here.
 GLenum buffer(GLenum b) {
+  if (b == GL_AUX0) return GL_COLOR_ATTACHMENT1_EXT;
   return (b == GL_BACK || b == GL_FRONT || b == GL_FRONT_AND_BACK || b == GL_BACK_LEFT || b == GL_FRONT_LEFT)
              ? GL_COLOR_ATTACHMENT0_EXT
              : b;
@@ -1296,7 +1471,11 @@ int written(const T* v, T marker) {
   while (n > 0 && memcmp(&v[n - 1], &marker, sizeof(T)) == 0) n--;
   return n > 0 ? n : 1;
 }
-GLenum guest_buffer(GLenum b) { return b == GL_COLOR_ATTACHMENT0_EXT ? GL_BACK : b; }
+GLenum guest_buffer(GLenum b) {
+  if (b == GL_COLOR_ATTACHMENT0_EXT) return GL_BACK;
+  if (b == GL_COLOR_ATTACHMENT1_EXT) return GL_AUX0;
+  return b;
+}
 void glGetIntegerv_(GuestCall& c) {
   const GLenum p = c.i();
   const u32 address = c.i();
@@ -1319,10 +1498,37 @@ void glGetIntegerv_(GuestCall& c) {
   for (GLint& x : v) x = marker;
   glGetIntegerv(p, v);
   if (p == GL_DRAW_BUFFER || p == GL_READ_BUFFER) v[0] = (GLint)guest_buffer((GLenum)v[0]);
+  if (p == GL_AUX_BUFFERS && t_current) v[0] = 1;
   if (p == GL_UNPACK_SWAP_BYTES) v[0] = t_current && t_current->unpack_swap;
   if (p == GL_PACK_SWAP_BYTES) v[0] = t_current && t_current->pack_swap;
   const int n = written(v, marker);
   for (int k = 0; out && k < n; k++) wr32(out + 4 * k, (u32)v[k]);
+}
+void glGetBooleanv_(GuestCall& c) {
+  const GLenum p = c.i();
+  const u32 address = c.i();
+  GLint count = 16;
+  GLenum count_name = 0;
+  if (p == GL_COMPRESSED_TEXTURE_FORMATS) count_name = GL_NUM_COMPRESSED_TEXTURE_FORMATS;
+  else if (p == 0x8df8) count_name = 0x8df9;  // shader binary formats
+  else if (p == 0x87ff) count_name = 0x87fe;  // program binary formats
+  if (count_name) {
+    glGetIntegerv(count_name, &count);
+    if (count <= 0) return;
+  }
+  std::vector<GLboolean> values((size_t)count, 0x7f);
+  glGetBooleanv(p, values.data());
+  if (p == GL_AUX_BUFFERS && t_current) values[0] = GL_TRUE;
+  if (p == GL_UNPACK_SWAP_BYTES) values[0] = t_current && t_current->unpack_swap;
+  if (p == GL_PACK_SWAP_BYTES) values[0] = t_current && t_current->pack_swap;
+  size_t n = values.size();
+  while (n && values[n - 1] == 0x7f) n--;
+  if (!n) return;
+  if (!address || !c.mem.range_ok(address, n, GuestMemory::kWrite)) {
+    log_warn("OpenGL: invalid boolean state result");
+    return;
+  }
+  memcpy(gp(c, address), values.data(), n);
 }
 void glGetFloatv_(GuestCall& c) {
   const GLenum p = c.i();
@@ -1333,6 +1539,8 @@ void glGetFloatv_(GuestCall& c) {
   memcpy(&marker, &bits, 4);
   for (GLfloat& x : v) x = marker;
   glGetFloatv(p, v);
+  if (p == GL_DRAW_BUFFER || p == GL_READ_BUFFER) v[0] = (GLfloat)guest_buffer((GLenum)v[0]);
+  if (p == GL_AUX_BUFFERS && t_current) v[0] = 1;
   const int n = written(v, marker);
   for (int k = 0; out && k < n; k++) {
     u32 w;
@@ -1349,6 +1557,8 @@ void glGetDoublev_(GuestCall& c) {
   memcpy(&marker, &bits, 8);
   for (GLdouble& x : v) x = marker;
   glGetDoublev(p, v);
+  if (p == GL_DRAW_BUFFER || p == GL_READ_BUFFER) v[0] = (GLdouble)guest_buffer((GLenum)v[0]);
+  if (p == GL_AUX_BUFFERS && t_current) v[0] = 1;
   const int n = written(v, marker);
   for (int k = 0; out && k < n; k++) {
     u64 w;
@@ -1357,8 +1567,8 @@ void glGetDoublev_(GuestCall& c) {
   }
 }
 
-// The extensions offered: the host's, less any whose functions cocaine
-// doesn't pass through.
+// The extensions offered by both the host and cocaine. ARB programs are
+// advertised for Halo even though not all of their entry points are done yet.
 const char* const kExtensions[] = {
     "GL_ARB_multitexture", "GL_EXT_compiled_vertex_array", "GL_ARB_texture_env_combine",
     "GL_EXT_texture_env_combine", "GL_ARB_texture_env_add", "GL_EXT_texture_env_add", "GL_ARB_texture_env_dot3",
@@ -1367,6 +1577,8 @@ const char* const kExtensions[] = {
     "GL_ARB_texture_cube_map", "GL_EXT_separate_specular_color", "GL_EXT_packed_pixels", "GL_APPLE_packed_pixels",
     "GL_EXT_texture_lod_bias", "GL_EXT_rescale_normal", "GL_ARB_texture_non_power_of_two",
     "GL_ARB_texture_compression", "GL_EXT_texture_compression_s3tc",
+    "GL_ARB_texture_rectangle", "GL_EXT_texture_rectangle",
+    "GL_ARB_vertex_program", "GL_ARB_fragment_program",
 };
 void glGetString_(GuestCall& c) {
   const GLenum name = c.i();
@@ -1437,7 +1649,10 @@ void glClipPlane_(GuestCall& c) {
 
 // ---- GL: immediate mode -------------------------------------------------------
 
-void glBegin_(GuestCall& c) { glBegin(c.i()); }
+void glBegin_(GuestCall& c) {
+  const GLenum mode = c.i();
+  glBegin(mode);
+}
 void glEnd_(GuestCall& c) { glEnd(); }
 void glNormal3f_(GuestCall& c) {
   const float x = c.f(), y = c.f(), z = c.f();
@@ -1506,9 +1721,19 @@ void glCallLists_(GuestCall& c) {
     glCallLists(count, type, src);
     return;
   }
-  std::vector<u8> converted((size_t)count * size);
-  for (int i = 0; i < count; i++)
-    for (int j = 0; j < size; j++) converted[(size_t)i * size + j] = src[(size_t)i * size + size - 1 - j];
+  const size_t bytes = (size_t)count * size;
+  auto convert = [&](u8* dst) {
+    for (int i = 0; i < count; i++)
+      for (int j = 0; j < size; j++) dst[(size_t)i * size + j] = src[(size_t)i * size + size - 1 - j];
+  };
+  u8 small[16];
+  if (bytes <= sizeof small) {
+    convert(small);
+    glCallLists(count, type, small);
+    return;
+  }
+  std::vector<u8> converted(bytes);
+  convert(converted.data());
   glCallLists(count, type, converted.data());
 }
 void glPushClientAttrib_(GuestCall& c) {
@@ -1520,6 +1745,7 @@ void glPushClientAttrib_(GuestCall& c) {
     s.normal = t_current->normal;
     s.color = t_current->color_array;
     for (int i = 0; i < 8; i++) s.tex[i] = t_current->tex[i];
+    s.attribs = t_current->attribs;
     s.unit = t_current->client_unit;
     s.unpack_swap = t_current->unpack_swap;
     s.pack_swap = t_current->pack_swap;
@@ -1537,6 +1763,7 @@ void glPopClientAttrib_(GuestCall& c) {
     t_current->normal = std::move(s.normal);
     t_current->color_array = std::move(s.color);
     for (int i = 0; i < 8; i++) t_current->tex[i] = std::move(s.tex[i]);
+    t_current->attribs = std::move(s.attribs);
     t_current->client_unit = s.unit;
   }
   if (s.mask & GL_CLIENT_PIXEL_STORE_BIT) {
@@ -1556,11 +1783,32 @@ void glVertex3f_(GuestCall& c) {
   const float x = c.f(), y = c.f(), z = c.f();
   glVertex3f(x, y, z);
 }
+void glVertex3d_(GuestCall& c) {
+  const double x = c.d(), y = c.d(), z = c.d();
+  glVertex3d(x, y, z);
+}
 void glVertex2fv_(GuestCall& c) { glVertex2fv(Floats<2>(c, c.i()).v); }
 void glVertex3fv_(GuestCall& c) { glVertex3fv(Floats<3>(c, c.i()).v); }
+void glVertex3dv_(GuestCall& c) { glVertex3dv(Doubles<3>(c, c.i()).v); }
 void glTexCoord2f_(GuestCall& c) {
   const float s = c.f(), t = c.f();
   glTexCoord2f(s, t);
+}
+void glTexCoord2d_(GuestCall& c) {
+  const double s = c.d(), t = c.d();
+  glTexCoord2d(s, t);
+}
+void glTexCoord2i_(GuestCall& c) {
+  const s32 s = (s32)c.i(), t = (s32)c.i();
+  glTexCoord2i(s, t);
+}
+void glTexCoord2s_(GuestCall& c) {
+  const GLshort s = (GLshort)c.i(), t = (GLshort)c.i();
+  glTexCoord2s(s, t);
+}
+void glTexCoord4f_(GuestCall& c) {
+  const float s = c.f(), t = c.f(), r = c.f(), q = c.f();
+  glTexCoord4f(s, t, r, q);
 }
 void glTexCoord2fv_(GuestCall& c) { glTexCoord2fv(Floats<2>(c, c.i()).v); }
 void glColor3f_(GuestCall& c) {
@@ -1572,6 +1820,7 @@ void glColor4f_(GuestCall& c) {
   glColor4f(r, g, b, a);
 }
 void glColor4fv_(GuestCall& c) { glColor4fv(Floats<4>(c, c.i()).v); }
+void glColor3fv_(GuestCall& c) { glColor3fv(Floats<3>(c, c.i()).v); }
 void glColor3i_(GuestCall& c) {
   const s32 r = (s32)c.i(), g = (s32)c.i(), b = (s32)c.i();
   glColor3i(r, g, b);
@@ -1631,6 +1880,28 @@ void glLightfv_(GuestCall& c) {
   const GLenum l = c.i(), p = c.i();
   glLightfv(l, p, Floats<4>(c, c.i(), params_of(p)).v);
 }
+void glGetLightfv_(GuestCall& c) {
+  const GLenum l = c.i(), p = c.i();
+  const u32 address = c.i();
+  if (!address || !c.mem.range_ok(address, 4 * params_of(p), GuestMemory::kWrite)) {
+    log_warn("OpenGL: invalid light query result");
+    return;
+  }
+  const u32 bits = 0x7FA5A5A5;
+  GLfloat marker;
+  memcpy(&marker, &bits, 4);
+  GLfloat v[4];
+  for (GLfloat& value : v) value = marker;
+  glGetLightfv(l, p, v);
+  u8* out = gp(c, address);
+  int n = 4;
+  while (n && memcmp(&v[n - 1], &marker, sizeof(marker)) == 0) n--;
+  for (int k = 0; k < n; k++) {
+    u32 w;
+    memcpy(&w, &v[k], 4);
+    wr32(out + 4 * k, w);
+  }
+}
 void glLightModelfv_(GuestCall& c) {
   const GLenum p = c.i();
   glLightModelfv(p, Floats<4>(c, c.i(), params_of(p)).v);
@@ -1669,6 +1940,69 @@ void glTexGenfv_(GuestCall& c) {
 
 // ---- GL: textures ---------------------------------------------------------------
 
+bool legacy_texture_filter() {
+  static const bool enabled = [] {
+    const char* value = getenv("COCAINE_GL_LEGACY_TEXTURE_FILTER");
+    return value && strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+void update_texture_mip_range(GLenum target, bool maximum_set = false) {
+  if (!legacy_texture_filter() || !t_current || target != GL_TEXTURE_2D) return;
+  GLint name = 0, base = 0, maximum = 0;
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &name);
+  glGetTexParameteriv(target, GL_TEXTURE_BASE_LEVEL, &base);
+  glGetTexParameteriv(target, GL_TEXTURE_MAX_LEVEL, &maximum);
+  if (!name) return;
+  auto& textures = *t_current->textures;
+  std::lock_guard<std::mutex> lock(textures.mutex);
+  auto it = textures.mip_ranges.find((GLuint)name);
+  if (it != textures.mip_ranges.end() && (maximum_set || maximum != it->second.applied))
+    it->second.requested = maximum;
+  GLint width = 0, height = 0, format = 0;
+  GLint size_limit = 0, level_limit = 0;
+  glGetIntegerv(GL_MAX_TEXTURE_SIZE, &size_limit);
+  while (size_limit > 1) {
+    size_limit /= 2;
+    level_limit++;
+  }
+  if (base <= level_limit) {
+    glGetTexLevelParameteriv(target, base, GL_TEXTURE_WIDTH, &width);
+    glGetTexLevelParameteriv(target, base, GL_TEXTURE_HEIGHT, &height);
+    glGetTexLevelParameteriv(target, base, GL_TEXTURE_INTERNAL_FORMAT, &format);
+  }
+  const bool dxt = format == GL_COMPRESSED_RGB_S3TC_DXT1_EXT ||
+                   format == GL_COMPRESSED_RGBA_S3TC_DXT1_EXT ||
+                   format == GL_COMPRESSED_RGBA_S3TC_DXT3_EXT ||
+                   format == GL_COMPRESSED_RGBA_S3TC_DXT5_EXT;
+  if (!dxt || width <= 0 || height <= 0) {
+    if (it != textures.mip_ranges.end()) {
+      glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, it->second.requested);
+      textures.mip_ranges.erase(it);
+    }
+    return;
+  }
+  if (it == textures.mip_ranges.end())
+    it = textures.mip_ranges.emplace((GLuint)name, TextureMipRange{maximum, maximum}).first;
+  auto& range = it->second;
+  GLint last = base;
+  while (last < range.requested && (width > 1 || height > 1)) {
+    width = std::max(1, width / 2);
+    height = std::max(1, height / 2);
+    GLint next_width = 0, next_height = 0, next_format = 0;
+    glGetTexLevelParameteriv(target, last + 1, GL_TEXTURE_WIDTH, &next_width);
+    glGetTexLevelParameteriv(target, last + 1, GL_TEXTURE_HEIGHT, &next_height);
+    glGetTexLevelParameteriv(target, last + 1, GL_TEXTURE_INTERNAL_FORMAT, &next_format);
+    if (next_width != width || next_height != height || next_format != format) break;
+    last++;
+  }
+  // Keep the guest's filter and range limit, but never sample missing DXT mip levels.
+  const GLint effective = std::min(range.requested, last);
+  if (effective != maximum) glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, effective);
+  range.applied = effective;
+}
+
 void glGenTextures_(GuestCall& c) {
   const s32 n = (s32)c.i();
   u8* out = gp(c, c.i());
@@ -1684,18 +2018,40 @@ void glDeleteTextures_(GuestCall& c) {
   std::vector<GLuint> v((size_t)n);
   for (s32 k = 0; k < n; k++) v[(size_t)k] = rd32(in + 4 * k);
   glDeleteTextures(n, v.data());
+  if (legacy_texture_filter() && t_current) {
+    auto& textures = *t_current->textures;
+    std::lock_guard<std::mutex> lock(textures.mutex);
+    for (GLuint name : v) textures.mip_ranges.erase(name);
+  }
 }
 void glBindTexture_(GuestCall& c) {
   const GLenum t = c.i();
-  glBindTexture(t, c.i());
+  const GLuint name = c.i();
+  const bool initialize = legacy_texture_filter() && t == GL_TEXTURE_2D && name && !glIsTexture(name);
+  glBindTexture(t, name);
+  if (initialize && glIsTexture(name)) glTexParameteri(t, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 }
 void glTexParameteri_(GuestCall& c) {
   const GLenum t = c.i(), p = c.i();
-  glTexParameteri(t, p, (GLint)c.i());
+  const GLint value = (GLint)c.i();
+  glTexParameteri(t, p, value);
+  if (p == GL_TEXTURE_BASE_LEVEL || p == GL_TEXTURE_MAX_LEVEL)
+    update_texture_mip_range(t, p == GL_TEXTURE_MAX_LEVEL && value >= 0);
 }
 void glTexParameterf_(GuestCall& c) {
   const GLenum t = c.i(), p = c.i();
-  glTexParameterf(t, p, c.f());
+  const GLfloat value = c.f();
+  glTexParameterf(t, p, value);
+  if (p == GL_TEXTURE_BASE_LEVEL || p == GL_TEXTURE_MAX_LEVEL)
+    update_texture_mip_range(t, p == GL_TEXTURE_MAX_LEVEL && std::isfinite(value) && value >= 0);
+}
+void glGetTexParameteriv_(GuestCall& c) {
+  const GLenum target = c.i(), parameter = c.i();
+  u8* out = gp(c, c.i());
+  GLint values[4] = {};
+  glGetTexParameteriv(target, parameter, values);
+  for (int k = 0; out && k < (parameter == GL_TEXTURE_BORDER_COLOR ? 4 : 1); k++)
+    wr32(out + 4 * k, (u32)values[k]);
 }
 void glTexImage2D_(GuestCall& c) {
   const GLenum target = c.i();
@@ -1705,6 +2061,47 @@ void glTexImage2D_(GuestCall& c) {
   const GLenum format = c.i(), type = c.i();
   const u32 pixels = c.i();
   glTexImage2D(target, level, internal, w, h, border, format, type, gp(c, pixels));
+  update_texture_mip_range(target);
+}
+void glTexImage3D_(GuestCall& c) {
+  const GLenum target = c.i();
+  const GLint level = (GLint)c.i(), internal = (GLint)c.i();
+  const GLsizei width = (GLsizei)c.i(), height = (GLsizei)c.i(), depth = (GLsizei)c.i();
+  const GLint border = (GLint)c.i();
+  const GLenum format = c.i(), type = c.i();
+  const u32 pixels = c.i();
+  if (pixels && width > 0 && height > 0 && depth > 0) {
+    int bytes_per_pixel = pixel_size(format, type);
+    if (type == GL_HALF_FLOAT) bytes_per_pixel = pixel_size(format, GL_SHORT);
+    if (format == GL_DEPTH_STENCIL && type == GL_UNSIGNED_INT_24_8) bytes_per_pixel = 4;
+    if (!bytes_per_pixel) {
+      log_warn("OpenGL: unsupported 3D texture format 0x%x type 0x%x", format, type);
+      return;
+    }
+    GLint row_length = 0, image_height = 0, skip_pixels = 0, skip_rows = 0, skip_images = 0, alignment = 0;
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+    glGetIntegerv(GL_UNPACK_IMAGE_HEIGHT, &image_height);
+    glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
+    glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
+    glGetIntegerv(GL_UNPACK_SKIP_IMAGES, &skip_images);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+    if (row_length < 0 || image_height < 0 || skip_pixels < 0 || skip_rows < 0 || skip_images < 0 ||
+        alignment <= 0) {
+      log_warn("OpenGL: invalid 3D texture unpack state");
+      return;
+    }
+    using Wide = __uint128_t;
+    const Wide row_bytes = (Wide)(row_length ? row_length : width) * bytes_per_pixel;
+    const Wide stride = (row_bytes + alignment - 1) / alignment * alignment;
+    const Wide image_stride = stride * (image_height ? image_height : height);
+    const Wide bytes = ((Wide)skip_images + depth - 1) * image_stride +
+                       ((Wide)skip_rows + height - 1) * stride + ((Wide)skip_pixels + width) * bytes_per_pixel;
+    if (bytes > UINT32_MAX || !c.mem.range_ok(pixels, (u32)bytes, GuestMemory::kRead)) {
+      log_warn("OpenGL: invalid 3D texture data");
+      return;
+    }
+  }
+  glTexImage3D(target, level, internal, width, height, depth, border, format, type, gp(c, pixels));
 }
 void glTexSubImage2D_(GuestCall& c) {
   const GLenum target = c.i();
@@ -1713,6 +2110,13 @@ void glTexSubImage2D_(GuestCall& c) {
   const GLenum format = c.i(), type = c.i();
   const u32 pixels = c.i();
   glTexSubImage2D(target, level, x, y, w, h, format, type, gp(c, pixels));
+}
+void glCopyTexSubImage2D_(GuestCall& c) {
+  const GLenum target = c.i();
+  const GLint level = (GLint)c.i(), xoffset = (GLint)c.i(), yoffset = (GLint)c.i();
+  const GLint x = (GLint)c.i(), y = (GLint)c.i();
+  const GLsizei width = (GLsizei)c.i(), height = (GLsizei)c.i();
+  glCopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height);
 }
 bool compressed_data_valid(GuestCall& c, u32 pixels, GLsizei size, bool allow_null = true) {
   if (size > 0 && ((!pixels && !allow_null) ||
@@ -1742,8 +2146,10 @@ void glCompressedTexImage2D_(GuestCall& c) {
   const GLint border = (GLint)c.i();
   const GLsizei size = (GLsizei)c.i();
   const u32 pixels = c.i();
-  if (compressed_data_valid(c, pixels, size))
+  if (compressed_data_valid(c, pixels, size)) {
     glCompressedTexImage2D(target, level, format, width, height, border, size, gp(c, pixels));
+    update_texture_mip_range(target);
+  }
 }
 void glCompressedTexImage3D_(GuestCall& c) {
   const GLenum target = c.i();
@@ -1811,11 +2217,78 @@ void glGetCompressedTexImage_(GuestCall& c) {
   }
   glGetCompressedTexImage(target, level, gp(c, pixels));
 }
+void glGetProgramivARB_(GuestCall& c) {
+  const GLenum target = c.i(), pname = c.i();
+  const u32 address = c.i();
+  if (!address || !c.mem.range_ok(address, 4, GuestMemory::kWrite)) {
+    log_warn("OpenGL: invalid program query result");
+    return;
+  }
+  GLint value = 0x7a5a7a5a;
+  glGetProgramivARB(target, pname, &value);
+  if (value != 0x7a5a7a5a) wr32(gp(c, address), (u32)value);
+}
+void glGenProgramsARB_(GuestCall& c) {
+  const GLsizei count = (GLsizei)c.i();
+  const u32 address = c.i();
+  if (count <= 0) return glGenProgramsARB(count, nullptr);
+  if (!address || !c.mem.range_ok(address, (u64)count * 4, GuestMemory::kWrite)) {
+    log_warn("OpenGL: invalid program name result");
+    return;
+  }
+  std::vector<GLuint> names((size_t)count);
+  glGenProgramsARB(count, names.data());
+  u8* out = gp(c, address);
+  for (GLsizei i = 0; i < count; i++) wr32(out + 4 * (size_t)i, names[(size_t)i]);
+}
+void glDeleteProgramsARB_(GuestCall& c) {
+  const GLsizei count = (GLsizei)c.i();
+  const u32 address = c.i();
+  if (count <= 0) return glDeleteProgramsARB(count, nullptr);
+  if (!address || !c.mem.range_ok(address, (u64)count * 4, GuestMemory::kRead)) {
+    log_warn("OpenGL: invalid program names");
+    return;
+  }
+  const u8* in = gp(c, address);
+  std::vector<GLuint> names((size_t)count);
+  for (GLsizei i = 0; i < count; i++) names[(size_t)i] = rd32(in + 4 * (size_t)i);
+  glDeleteProgramsARB(count, names.data());
+}
+void glBindProgramARB_(GuestCall& c) {
+  const GLenum target = c.i();
+  glBindProgramARB(target, c.i());
+}
+void glProgramStringARB_(GuestCall& c) {
+  const GLenum target = c.i(), format = c.i();
+  const GLsizei length = (GLsizei)c.i();
+  const u32 address = c.i();
+  if (length > 0 && (!address || !c.mem.range_ok(address, (u32)length, GuestMemory::kRead))) {
+    log_warn("OpenGL: invalid program string");
+    return;
+  }
+  glProgramStringARB(target, format, length, gp(c, address));
+}
+void glProgramEnvParameter4fvARB_(GuestCall& c) {
+  const GLenum target = c.i();
+  const GLuint index = c.i();
+  const u32 address = c.i();
+  if (!address || !c.mem.range_ok(address, 16, GuestMemory::kRead)) {
+    log_warn("OpenGL: invalid program environment parameter");
+    return;
+  }
+  glProgramEnvParameter4fvARB(target, index, Floats<4>(c, address).v);
+}
 void glReadPixels_(GuestCall& c) {
   const GLint x = (GLint)c.i(), y = (GLint)c.i();
   const GLsizei w = (GLsizei)c.i(), h = (GLsizei)c.i();
   const GLenum format = c.i(), type = c.i();
   glReadPixels(x, y, w, h, format, type, gp(c, c.i()));
+}
+void glGetTexImage_(GuestCall& c) {
+  const GLenum target = c.i();
+  const GLint level = (GLint)c.i();
+  const GLenum format = c.i(), type = c.i();
+  glGetTexImage(target, level, format, type, gp(c, c.i()));
 }
 void glActiveTextureARB_(GuestCall& c) { glActiveTextureARB(c.i()); }
 
@@ -1872,6 +2345,37 @@ void glClientActiveTextureARB_(GuestCall& c) {
   if (t_current) t_current->client_unit = (int)(unit - GL_TEXTURE0);
   glClientActiveTextureARB(unit);
 }
+void glVertexAttribPointerARB_(GuestCall& c) {
+  const GLuint index = c.i();
+  const GLint size = (GLint)c.i();
+  const GLenum type = c.i();
+  const GLboolean normalized = (GLboolean)c.i();
+  const GLsizei stride = (GLsizei)c.i();
+  const u32 ptr = c.i();
+  const bool valid_type = type == GL_BYTE || type == GL_UNSIGNED_BYTE || type == GL_SHORT ||
+                          type == GL_UNSIGNED_SHORT || type == GL_INT || type == GL_UNSIGNED_INT ||
+                          type == GL_FLOAT || type == GL_DOUBLE;
+  if (!t_current || index >= t_current->attribs.size() || size < 1 || size > 4 || stride < 0 || !valid_type) {
+    glVertexAttribPointerARB(index, size, type, normalized, stride, nullptr);
+    return;
+  }
+  Array& a = t_current->attribs[index];
+  a.size = size;
+  a.type = type;
+  a.normalized = normalized;
+  a.stride = stride;
+  a.ptr = ptr;
+}
+void glEnableVertexAttribArrayARB_(GuestCall& c) {
+  const GLuint index = c.i();
+  if (t_current && index < t_current->attribs.size()) t_current->attribs[index].on = true;
+  glEnableVertexAttribArrayARB(index);
+}
+void glDisableVertexAttribArrayARB_(GuestCall& c) {
+  const GLuint index = c.i();
+  if (t_current && index < t_current->attribs.size()) t_current->attribs[index].on = false;
+  glDisableVertexAttribArrayARB(index);
+}
 
 // Elements lo..hi of an array, converted for the host, at the same indices.
 const void* convert(GuestCall& c, Array& a, u32 lo, u32 hi) {
@@ -1902,45 +2406,129 @@ const void* convert(GuestCall& c, Array& a, u32 lo, u32 hi) {
   }
   return a.host.data();
 }
-void prepare_arrays(GuestCall& c, u32 lo, u32 hi) {
+bool program_uses_generic_attribute(size_t index) {
+  GLint length = 0;
+  glGetProgramivARB(GL_VERTEX_PROGRAM_ARB, GL_PROGRAM_LENGTH_ARB, &length);
+  if (length <= 0) return true;
+  std::string source((size_t)length, '\0');
+  glGetProgramStringARB(GL_VERTEX_PROGRAM_ARB, GL_PROGRAM_STRING_ARB, source.data());
+  std::string tokens;
+  bool comment = false;
+  for (char ch : source) {
+    if (ch == '\n' || ch == '\r') comment = false;
+    else if (ch == '#') comment = true;
+    else if (!comment && !std::isspace((unsigned char)ch)) tokens += ch;
+  }
+  const std::string binding = "vertex.attrib";
+  size_t at = 0;
+  while ((at = tokens.find(binding, at)) != std::string::npos) {
+    at += binding.size();
+    if (at >= tokens.size() || tokens[at++] != '[') return true;
+    if (at < tokens.size() && tokens[at] == '+') at++;
+    if (at >= tokens.size() || !std::isdigit((unsigned char)tokens[at])) return true;
+    size_t number = 0;
+    while (at < tokens.size() && std::isdigit((unsigned char)tokens[at])) {
+      const unsigned digit = (unsigned)(tokens[at++] - '0');
+      if (number > (SIZE_MAX - digit) / 10) return true;
+      number = number * 10 + digit;
+    }
+    if (at >= tokens.size() || tokens[at++] != ']') return true;
+    if (number == index) return true;
+  }
+  return false;
+}
+bool prepare_arrays(GuestCall& c, u32 lo, u32 hi) {
   Context* x = t_current;
-  if (!x) return;
-  if (x->vertex.on && x->vertex.ptr) glVertexPointer(x->vertex.size, x->vertex.type, 0, convert(c, x->vertex, lo, hi));
-  if (x->normal.on && x->normal.ptr) glNormalPointer(x->normal.type, 0, convert(c, x->normal, lo, hi));
-  if (x->color_array.on && x->color_array.ptr)
-    glColorPointer(x->color_array.size, x->color_array.type, 0, convert(c, x->color_array, lo, hi));
+  if (!x) return false;
+  const bool vertex_program = glIsEnabled(GL_VERTEX_PROGRAM_ARB);
+  auto array_pointer = [&](Array& a, GLsizei& stride, bool checked) -> const void* {
+    stride = 0;
+    if ((!c.powerpc || type_size(a.type) == 1) && a.ptr && a.stride >= 0) {
+      const u64 element = (u64)a.size * type_size(a.type);
+      const u64 source_stride = a.stride ? (u32)a.stride : element;
+      const u64 end = (u64)a.ptr + (u64)hi * source_stride + element;
+      if (element && end <= GuestMemory::kSpan &&
+          ((checked && lo == 0) || c.mem.range_ok(a.ptr, end - a.ptr, GuestMemory::kRead))) {
+        stride = a.stride;
+        return gp(c, a.ptr);
+      }
+    }
+    return convert(c, a, lo, hi);
+  };
+  for (size_t i = 0; i < x->attribs.size(); i++) {
+    Array& a = x->attribs[i];
+    if (!a.on) continue;
+    // Fixed-function draws use conventional arrays, with generic position as a fallback.
+    if (!vertex_program && (i != 0 || x->vertex.on)) continue;
+    const u64 element = (u64)a.size * type_size(a.type);
+    const u64 step = a.stride ? (u32)a.stride : element;
+    const u64 start = (u64)a.ptr + (u64)lo * step;
+    const u64 end = (u64)a.ptr + (u64)hi * step + element;
+    if (!a.ptr || end > GuestMemory::kSpan || start >= end ||
+        !c.mem.range_ok((u32)start, end - start, GuestMemory::kRead)) {
+      if (vertex_program && !program_uses_generic_attribute(i)) continue;
+      log_warn("OpenGL: invalid vertex attribute array %zu (pointer %#x, vertices %u..%u, vertex program %s)",
+               i, a.ptr, lo, hi, vertex_program ? "enabled" : "disabled");
+      return false;
+    }
+    GLsizei stride;
+    const void* ptr = array_pointer(a, stride, true);
+    glVertexAttribPointerARB((GLuint)i, a.size, a.type, a.normalized, stride, ptr);
+  }
+  if (x->vertex.on && x->vertex.ptr) {
+    GLsizei stride;
+    const void* ptr = array_pointer(x->vertex, stride, false);
+    glVertexPointer(x->vertex.size, x->vertex.type, stride, ptr);
+  }
+  if (x->normal.on && x->normal.ptr) {
+    GLsizei stride;
+    const void* ptr = array_pointer(x->normal, stride, false);
+    glNormalPointer(x->normal.type, stride, ptr);
+  }
+  if (x->color_array.on && x->color_array.ptr) {
+    GLsizei stride;
+    const void* ptr = array_pointer(x->color_array, stride, false);
+    glColorPointer(x->color_array.size, x->color_array.type, stride, ptr);
+  }
   bool switched = false;
   for (int u = 0; u < 8; u++) {
     Array& a = x->tex[u];
     if (!a.on || !a.ptr) continue;
     glClientActiveTextureARB(GL_TEXTURE0 + (GLenum)u);
     switched = true;
-    glTexCoordPointer(a.size, a.type, 0, convert(c, a, lo, hi));
+    GLsizei stride;
+    const void* ptr = array_pointer(a, stride, false);
+    glTexCoordPointer(a.size, a.type, stride, ptr);
   }
   if (switched) glClientActiveTextureARB(GL_TEXTURE0 + (GLenum)x->client_unit);
+  return true;
 }
 void glDrawArrays_(GuestCall& c) {
   const GLenum mode = c.i();
   const GLint first = (GLint)c.i();
   const GLsizei count = (GLsizei)c.i();
   if (count <= 0 || first < 0) return;
-  prepare_arrays(c, (u32)first, (u32)(first + count - 1));
+  if ((u64)first + (u64)count - 1 > UINT32_MAX ||
+      !prepare_arrays(c, (u32)first, (u32)((u64)first + count - 1))) return;
   glDrawArrays(mode, first, count);
 }
 void draw_elements(GuestCall& c, GLenum mode, GLsizei count, GLenum type, u32 indices) {
   const u8* in = gp(c, indices);
   if (count <= 0 || !in) return;
+  const bool direct = type == GL_UNSIGNED_BYTE ||
+                      (!c.powerpc && (type == GL_UNSIGNED_SHORT || type == GL_UNSIGNED_INT));
   static thread_local std::vector<GLuint> idx;
-  idx.resize((size_t)count);
+  if (!direct) idx.resize((size_t)count);
   u32 lo = 0xFFFFFFFFu, hi = 0;
   for (GLsizei k = 0; k < count; k++) {
     const u32 v = type == GL_UNSIGNED_BYTE ? in[k] : type == GL_UNSIGNED_SHORT ? rd16(in + 2 * k) : rd32(in + 4 * k);
-    idx[(size_t)k] = v;
+    if (!direct) idx[(size_t)k] = v;
     lo = std::min(lo, v);
     hi = std::max(hi, v);
   }
-  prepare_arrays(c, lo, hi);
-  glDrawElements(mode, count, GL_UNSIGNED_INT, idx.data());
+  if (!prepare_arrays(c, lo, hi)) return;
+  const void* elements = direct ? static_cast<const void*>(in) : static_cast<const void*>(idx.data());
+  glDrawElements(mode, count, direct ? type : GL_UNSIGNED_INT, elements);
 }
 void glDrawElements_(GuestCall& c) {
   const GLenum mode = c.i();
@@ -2015,26 +2603,32 @@ const HookSpec kGL[] = {
     {"CGLGetCurrentContext", cglGetCurrentContext},
     H(glEnable), H(glDisable), H(glDepthRange), H(glClearDepth), H(glLightModeli), H(glMaterialf),
     H(glPointSize), H(glShadeModel), H(glIsEnabled), H(glClear), H(glClearColor), H(glViewport), H(glBlendFunc),
+    H(glBlendEquation),
     H(glScissor), H(glColorMaterial),
     H(glAlphaFunc), H(glCullFace), H(glFrontFace), H(glDepthFunc), H(glDepthMask), H(glColorMask),
     H(glStencilFunc), H(glStencilMask), H(glStencilOp), H(glPolygonMode), H(glPolygonOffset), H(glLineWidth),
+    H(glLineStipple),
     H(glHint), H(glPushAttrib), H(glPopAttrib), H(glPushClientAttrib), H(glPopClientAttrib),
     H(glFinish), H(glFlush), H(glGetError), H(glDrawBuffer), H(glReadBuffer),
-    H(glPixelStorei), H(glGetIntegerv), H(glGetFloatv), H(glGetDoublev), H(glGetString), H(glMatrixMode),
+    H(glPixelStorei), H(glGetIntegerv), H(glGetBooleanv), H(glGetFloatv), H(glGetDoublev), H(glGetString), H(glMatrixMode),
     H(glLoadIdentity), H(glPushMatrix), H(glPopMatrix), H(glLoadMatrixf), H(glMultMatrixf), H(glTranslatef),
     H(glScalef), H(glRotatef), H(glOrtho), H(glFrustum), H(glClipPlane), H(glBegin), H(glEnd), H(glVertex2f),
     H(glNormal3f), H(glRasterPos2f), H(glBitmap), H(glGenLists), H(glNewList), H(glEndList),
     H(glCallList), H(glCallLists), H(glListBase), H(glDeleteLists),
-    H(glVertex2i), H(glVertex3f), H(glVertex2fv), H(glVertex3fv), H(glTexCoord2f), H(glTexCoord2fv),
+    H(glVertex2i), H(glVertex3f), H(glVertex3d), H(glVertex2fv), H(glVertex3fv), H(glVertex3dv),
+    H(glTexCoord2f), H(glTexCoord2d), H(glTexCoord2i), H(glTexCoord2s), H(glTexCoord4f), H(glTexCoord2fv),
     H(glColor3f), H(glColor4f),
-    H(glColor4fv), H(glColor3i), H(glColor3ub), H(glColor4ub), H(glColor3ubv), H(glColor4ubv), H(glRecti),
-    H(glFogf), H(glFogi), H(glFogfv), H(glLightf), H(glLightfv), H(glLightModelfv), H(glMaterialfv),
+    H(glColor4fv), H(glColor3fv), H(glColor3i), H(glColor3ub), H(glColor4ub), H(glColor3ubv), H(glColor4ubv), H(glRecti),
+    H(glFogf), H(glFogi), H(glFogfv), H(glLightf), H(glLightfv), H(glGetLightfv), H(glLightModelfv), H(glMaterialfv),
     H(glTexEnvf), H(glTexEnvi), H(glTexEnvfv), H(glGetTexEnviv), H(glTexGeni), H(glTexGenfv), H(glGenTextures),
-    H(glDeleteTextures), H(glBindTexture), H(glTexParameteri), H(glTexParameterf), H(glTexImage2D),
-    H(glTexSubImage2D), H(glReadPixels), H(glActiveTextureARB), H(glVertexPointer), H(glNormalPointer),
+    H(glDeleteTextures), H(glBindTexture), H(glTexParameteri), H(glTexParameterf),
+    H(glGetTexParameteriv), H(glTexImage2D), H(glTexImage3D),
+    H(glTexSubImage2D), H(glCopyTexSubImage2D), H(glReadPixels), H(glGetTexImage), H(glActiveTextureARB), H(glVertexPointer), H(glNormalPointer),
     H(glCompressedTexImage1D), H(glCompressedTexImage2D), H(glCompressedTexImage3D),
     H(glCompressedTexSubImage1D), H(glCompressedTexSubImage2D), H(glCompressedTexSubImage3D),
     H(glGetCompressedTexImage), H(glGetTexLevelParameteriv),
+    H(glGetProgramivARB), H(glGenProgramsARB), H(glDeleteProgramsARB), H(glBindProgramARB),
+    H(glProgramStringARB), H(glProgramEnvParameter4fvARB),
     {"glCompressedTexImage1DARB", glCompressedTexImage1D_},
     {"glCompressedTexImage2DARB", glCompressedTexImage2D_},
     {"glCompressedTexImage3DARB", glCompressedTexImage3D_},
@@ -2043,6 +2637,7 @@ const HookSpec kGL[] = {
     {"glCompressedTexSubImage3DARB", glCompressedTexSubImage3D_},
     {"glGetCompressedTexImageARB", glGetCompressedTexImage_},
     H(glColorPointer), H(glTexCoordPointer), H(glEnableClientState), H(glDisableClientState),
+    H(glVertexAttribPointerARB), H(glEnableVertexAttribArrayARB), H(glDisableVertexAttribArrayARB),
     H(glClientActiveTextureARB), H(glDrawArrays), H(glDrawElements), H(glDrawRangeElements),
     {"glDrawRangeElementsEXT", glDrawRangeElements_}, H(glArrayElement), H(glLockArraysEXT),
     H(glUnlockArraysEXT),
@@ -2050,6 +2645,7 @@ const HookSpec kGL[] = {
 #undef H
 
 const HookSpec kAGL[] = {
+    {"aglGetVersion", aglGetVersion, true},
     {"aglChoosePixelFormat", aglChoosePixelFormat},
     {"aglChoosePixelFormatCFM", aglChoosePixelFormat},
     {"aglQueryRendererInfo", aglQueryRendererInfo},
@@ -2066,6 +2662,7 @@ const HookSpec kAGL[] = {
     {"aglSetCurrentContext", aglSetCurrentContext},
     {"aglGetCurrentContext", aglGetCurrentContext},
     {"aglSetDrawable", aglSetDrawable},
+    {"aglGetDrawable", aglGetDrawable},
     {"aglUpdateContext", aglUpdateContext},
     {"aglSwapBuffers", aglSwapBuffers},
     {"aglSetFullScreen", aglSetFullScreen},
@@ -2075,10 +2672,12 @@ const HookSpec kAGL[] = {
     {"aglErrorString", aglErrorString},
 };
 const HookSpec kGLU[] = {
-    {"gluOrtho2D", gluOrtho2D}, {"gluPerspective", gluPerspective_},
+    {"gluOrtho2D", gluOrtho2D}, {"gluPerspective", gluPerspective_}, {"gluLookAt", gluLookAt_},
     {"gluNewQuadric", gluNewQuadric_}, {"gluDeleteQuadric", gluDeleteQuadric_},
     {"gluQuadricNormals", gluQuadricNormals_}, {"gluQuadricTexture", gluQuadricTexture_},
-    {"gluSphere", gluSphere_}, {"gluCylinder", gluCylinder_}, {"gluBuild2DMipmaps", gluBuild2DMipmaps_},
+    {"gluQuadricOrientation", gluQuadricOrientation_},
+    {"gluSphere", gluSphere_}, {"gluCylinder", gluCylinder_}, {"gluDisk", gluDisk_},
+    {"gluPartialDisk", gluPartialDisk_}, {"gluBuild2DMipmaps", gluBuild2DMipmaps_},
 };
 const HookSpec kCGL[] = {
     {"CGLChoosePixelFormat", cglChoosePixelFormat},
@@ -2096,6 +2695,7 @@ const HookSpec kCGL[] = {
     {"CGLSetSurface", cglSetSurface},
     {"CGLUpdateContext", cglUpdateContext},
     {"CGLSetParameter", cglSetParameter},
+    {"CGLGetParameter", cglGetParameter},
     {"CGLFlushDrawable", cglFlushDrawable},
 };
 

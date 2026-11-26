@@ -190,7 +190,8 @@ void names_out(GuestCall& c, void (*gen)(ALsizei, ALuint*)) {
   const ALsizei n = (ALsizei)c.i();
   u8* out = gp(c, c.i());
   if (n <= 0 || !out) return;
-  std::vector<ALuint> v((size_t)n);
+  static thread_local std::vector<ALuint> v;
+  v.resize((size_t)n);
   gen(n, v.data());
   for (ALsizei k = 0; k < n; k++) wr32(out + 4 * k, v[(size_t)k]);
   if (g_trace) for (ALuint name : v) log_info("OpenAL: made %u", name);
@@ -199,7 +200,8 @@ void names_in(GuestCall& c, void (*del)(ALsizei, const ALuint*)) {
   const ALsizei n = (ALsizei)c.i();
   const u8* in = gp(c, c.i());
   if (n <= 0 || !in) return;
-  std::vector<ALuint> v((size_t)n);
+  static thread_local std::vector<ALuint> v;
+  v.resize((size_t)n);
   for (ALsizei k = 0; k < n; k++) v[(size_t)k] = rd32(in + 4 * k);
   if (g_trace) for (ALuint name : v) log_info("OpenAL: deleting %u", name);
   del(n, v.data());
@@ -435,7 +437,8 @@ void alSourceQueueBuffers_(GuestCall& c) {
   const ALsizei n = (ALsizei)c.i();
   const u8* in = gp(c, c.i());
   if (n <= 0 || !in) return;
-  std::vector<ALuint> v((size_t)n);
+  static thread_local std::vector<ALuint> v;
+  v.resize((size_t)n);
   for (ALsizei k = 0; k < n; k++) v[(size_t)k] = rd32(in + 4 * k);
   alSourceQueueBuffers(s, n, v.data());
   if (g_trace) log_info("OpenAL: alSourceQueueBuffers(%u, %d) first %u", s, (int)n, v[0]);
@@ -460,7 +463,8 @@ void alSourceUnqueueBuffers_(GuestCall& c) {
   const ALsizei n = (ALsizei)c.i();
   u8* out = gp(c, c.i());
   if (n <= 0 || !out) return;
-  std::vector<ALuint> v((size_t)n);
+  static thread_local std::vector<ALuint> v;
+  v.resize((size_t)n);
   alSourceUnqueueBuffers(s, n, v.data());
   if (g_trace) log_info("OpenAL: alSourceUnqueueBuffers(%u, %d) first %u", s, (int)n, v[0]);
   for (ALsizei k = 0; k < n; k++) wr32(out + 4 * k, v[(size_t)k]);
